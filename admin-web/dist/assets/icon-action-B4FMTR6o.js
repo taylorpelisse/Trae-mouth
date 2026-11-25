@@ -1,1 +1,0 @@
-import{j as o,T as n,A as r,B as a,C as e}from"./index-CuYJbxQt.js";function p({label:t,children:i,...s}){return o.jsxs(n,{children:[o.jsx(r,{asChild:!0,children:o.jsx(a,{variant:"ghost",size:"iconSm","aria-label":typeof t=="string"?t:void 0,...s,children:i})}),o.jsx(e,{children:t})]})}export{p as I};

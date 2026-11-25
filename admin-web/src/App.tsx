@@ -1,45 +1,20 @@
-import { lazy, Suspense } from "react";
+import type { ReactNode } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { AppShell } from "./components/layout/app-shell";
 import { apiGet } from "./lib/api";
 import { LoginPage } from "./pages/login-page";
-
-const DashboardPage = lazy(() =>
-  import("./pages/dashboard-page").then((module) => ({
-    default: module.DashboardPage,
-  })),
-);
-const AccountsPage = lazy(() =>
-  import("./pages/accounts-page").then((module) => ({
-    default: module.AccountsPage,
-  })),
-);
-const ModelsPage = lazy(() =>
-  import("./pages/models-page").then((module) => ({
-    default: module.ModelsPage,
-  })),
-);
-const KeysPage = lazy(() =>
-  import("./pages/keys-page").then((module) => ({ default: module.KeysPage })),
-);
-const LogsPage = lazy(() =>
-  import("./pages/logs-page").then((module) => ({ default: module.LogsPage })),
-);
-const SettingsPage = lazy(() =>
-  import("./pages/settings-page").then((module) => ({
-    default: module.SettingsPage,
-  })),
-);
-const PlaygroundPage = lazy(() =>
-  import("./pages/playground-page").then((module) => ({
-    default: module.PlaygroundPage,
-  })),
-);
+import { DashboardPage } from "./pages/dashboard-page";
+import { AccountsPage } from "./pages/accounts-page";
+import { ModelsPage } from "./pages/models-page";
+import { KeysPage } from "./pages/keys-page";
+import { LogsPage } from "./pages/logs-page";
+import { SettingsPage } from "./pages/settings-page";
+import { PlaygroundPage } from "./pages/playground-page";
 
 type Me = { ok: boolean; username: string };
 
-function RequireAuth({ children }: { children: React.ReactNode }) {
+function RequireAuth({ children }: { children: ReactNode }) {
   const location = useLocation();
   const query = useQuery({
     queryKey: ["admin", "me"],
@@ -81,14 +56,7 @@ function NotFound() {
 
 export function App() {
   return (
-    <Suspense
-      fallback={
-        <div className="flex min-h-screen items-center justify-center text-13 text-muted">
-          加载中…
-        </div>
-      }
-    >
-      <Routes>
+    <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route
         element={
@@ -107,7 +75,6 @@ export function App() {
       </Route>
       <Route path="/" element={<Navigate to="/dashboard" replace />} />
       <Route path="*" element={<NotFound />} />
-      </Routes>
-    </Suspense>
+    </Routes>
   );
 }
