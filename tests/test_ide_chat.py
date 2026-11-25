@@ -742,3 +742,143 @@ def test_convert_messages_accepts_legacy_function_role() -> None:
     assert "Client tool result" in text
     assert "name=search" in text
     assert "search result" in text
+
+
+def test_tool_block_filter_keeps_dsml_sample_inside_argument() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    sample = (
+        '<||DSML||invoke name="Read">'
+        '<||DSML||parameter name="file_path" string="true">a.py'
+        "</||DSML||parameter></||DSML||invoke>"
+    )
+    text = (
+        "< | | DSML | | tool_calls>\n"
+        '< | | DSML | | invoke name="Edit">\n'
+        "< | | DSML | | parameter name=\"file_path\" string=\"true\">"
+        "tests/x.py</ | | DSML | | parameter>\n"
+        "< | | DSML | | parameter name=\"old_string\" string=\"true\">"
+        f"old = '{sample}'\n"
+        "</ | | DSML | | parameter>\n"
+        "< | | DSML | | parameter name=\"new_string\" string=\"true\">"
+        "new = 1</ | | DSML | | parameter>\n"
+        "</ | | DSML | | invoke>\n</ | | DSML | | tool_calls>"
+    )
+    visible, calls = flt.feed(text)
+    assert visible == ""
+    assert calls == [
+        {
+            "name": "Edit",
+            "arguments": {
+                "file_path": "tests/x.py",
+                "old_string": f"old = '{sample}'\n",
+                "new_string": "new = 1",
+            },
+        }
+    ]
+
+
+def test_tool_block_filter_ignores_lone_closing_tag_inside_argument() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    text = (
+        "<||DSML||tool_calls>"
+        '<||DSML||invoke name="Edit">'
+        '<||DSML||parameter name="old_string" string="true">'
+        'drop "</||DSML||parameter>" here\n</||DSML||parameter>'
+        '<||DSML||parameter name="new_string" string="true">'
+        "done</||DSML||parameter>"
+        "</||DSML||invoke></||DSML||tool_calls>"
+    )
+    visible, calls = flt.feed(text)
+    assert visible == ""
+    assert calls == [
+        {
+            "name": "Edit",
+            "arguments": {
+                "old_string": 'drop "</||DSML||parameter>" here\n',
+                "new_string": "done",
+            },
+        }
+    ]
+
+
+def test_tool_block_filter_recovers_single_bar_dsml_call() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    text = (
+        "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"Bash\">\n"
+        '<｜DSML｜parameter name="command" string="true">echo hi</｜DSML｜parameter>\n'
+        "</｜DSML｜invoke>\n</｜DSML｜function_calls>"
+    )
+    visible, calls = flt.feed(text)
+    assert visible == ""
+    assert calls == [{"name": "Bash", "arguments": {"command": "echo hi"}}]
+
+
+def test_tool_block_filter_waits_before_trusting_closing_tag() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    pieces = [
+        "<||DSML||tool_calls><||DSML||invoke name=\"Edit\">",
+        '<||DSML||parameter name="old_string" string="true">'
+        'keep "</||DSML||parameter>"',
+        " here</||DSML||parameter>",
+        '<||DSML||parameter name="new_string" string="true">'
+        "x</||DSML||parameter>",
+        "</||DSML||invoke></||DSML||tool_calls>",
+    ]
+    text = ""
+    for piece in pieces[:-1]:
+        text += piece
+        assert flt.feed(text) == ("", [])
+    text += pieces[-1]
+    visible, calls = flt.feed(text)
+    assert visible == ""
+    assert calls == [
+        {
+            "name": "Edit",
+            "arguments": {
+                "old_string": 'keep "</||DSML||parameter>" here',
+                "new_string": "x",
+            },
+        }
+    ]
+
+
+def test_tool_block_filter_final_closes_unclosed_block_without_leak() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    pieces = [
+        "先看一下 ",
+        "< | | DS",
+        "ML | | tool_",
+        "calls>\n< | | DSML | | invoke name=\"Bash\">",
+        "< | | DSML | | parameter name=\"command\" string=\"true\">"
+        "echo hi</ | | DSML | | parameter>",
+        "\n</ | | DSML | | invoke>",
+    ]
+    text = ""
+    for piece in pieces[:-1]:
+        text += piece
+        assert flt.feed(text) == ("先看一下 ", [])
+    text += pieces[-1]
+    visible, calls = flt.feed(text)
+    assert visible == "先看一下 "
+    assert calls == [{"name": "Bash", "arguments": {"command": "echo hi"}}]
+    assert flt.feed(text, final=True) == ("先看一下 ", [])
+
+
+def test_tool_block_filter_final_releases_quoted_wrapper_as_text() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    text = "格式是：< | | DSML | | tool_calls>\n后面仍是正文"
+    assert flt.feed(text) == ("格式是：", [])
+    assert flt.native_incomplete.startswith("< | | DSML | | tool_calls>")
+    assert flt.feed(text, final=True) == (text, [])
+
+
+def test_tool_block_filter_final_flags_cut_argument() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    text = (
+        "<||DSML||tool_calls><||DSML||invoke name=\"Edit\">"
+        '<||DSML||parameter name="new_string" string="true">half'
+    )
+    assert flt.feed(text) == ("", [])
+    assert flt.native_truncated is False
+    assert flt.feed(text, final=True) == ("", [])
+    assert flt.native_truncated is True

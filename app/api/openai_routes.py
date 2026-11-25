@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import threading
 import time
 import uuid
@@ -314,7 +315,11 @@ class OpenAIStreamTranslator:
                     strict=self.strict_tool_args,
                 )
             except ValueError as exc:
-                raise UpstreamError(str(exc), status_code=502) from exc
+                # Invalid model arguments are a request problem, not an account
+                # failure; a 502 here would cool down the whole pool.
+                raise UpstreamError(
+                    str(exc), status_code=400, account_fault=False
+                ) from exc
         elif not isinstance(arguments, Mapping):
             arguments = {"value": arguments}
         key = json.dumps(
@@ -534,11 +539,7 @@ class OpenAIStreamTranslator:
         chunks.append(self._chunk({"reasoning_content": reasoning}))
 
     def _finalize_calls(self) -> str:
-        visible, new_calls = self.filter.feed(self.response.text)
-        partial = self.filter.release_native_partial()
-        if partial:
-            # A trailing fragment that never became a call marker is text.
-            visible += partial
+        visible, new_calls = self.filter.feed(self.response.text, final=True)
         incomplete = self.filter.incomplete
         if incomplete:
             if ide_chat.TOOL_START.startswith(incomplete):
@@ -547,7 +548,8 @@ class OpenAIStreamTranslator:
                 # ordinary text, not an interrupted tool call.
                 if len(incomplete) >= 8:
                     raise UpstreamError(
-                        "tool call output was interrupted before its payload"
+                        "tool call output was interrupted before its payload",
+                        account_fault=False,
                     )
             else:
                 salvaged = ide_chat._parse_tool_block(incomplete)
@@ -555,19 +557,27 @@ class OpenAIStreamTranslator:
                     new_calls.extend(salvaged)
                 else:
                     raise UpstreamError(
-                        "tool call output was truncated before completion"
+                        "tool call output was truncated before completion",
+                        account_fault=False,
                     )
+        if self.filter.native_truncated:
+            raise UpstreamError(
+                "native tool call output was truncated before completion",
+                account_fault=False,
+            )
         if self.filter.native_incomplete:
             native = self.filter.native_incomplete
-            salvaged = ide_chat._parse_dsml_calls(native)
-            if not salvaged:
-                salvaged = ide_chat._parse_json_tool_calls(native)
+            salvaged = ide_chat._parse_json_tool_calls(native)
             if salvaged:
                 new_calls.extend(salvaged)
-            else:
+            elif "{" in native:
                 raise UpstreamError(
-                    "native tool call output was truncated before completion"
+                    "native tool call output was truncated before completion",
+                    account_fault=False,
                 )
+            else:
+                # A call marker quoted in prose is text, not an interrupted call.
+                visible += native
         delta = ""
         if visible.startswith(self.visible):
             delta = visible[len(self.visible) :]
@@ -622,7 +632,9 @@ class OpenAIStreamTranslator:
                     "upstream stream ended before the done event", status_code=502
                 )
         if self.tools_required and not self.calls:
-            raise UpstreamError("model did not call a required tool")
+            raise UpstreamError(
+                "model did not call a required tool", account_fault=False
+            )
         if (
             self.reasoning_as_content
             and not self.calls
@@ -645,7 +657,9 @@ class OpenAIStreamTranslator:
             and not self.emitted_reasoning
             and not self.content_filtered
         ):
-            raise UpstreamError("model returned neither text nor a tool call")
+            raise UpstreamError(
+                "model returned neither text nor a tool call", account_fault=False
+            )
         finish = (
             "tool_calls"
             if self.calls
@@ -696,12 +710,32 @@ class OpenAIStreamTranslator:
         }
 
 
+_UPSTREAM_STATUS_RE = re.compile(r"error code[:\s]+(\d{3})")
+
+
 def _upstream_error_status(data: Mapping[str, Any]) -> int:
     """Classify an upstream SSE error as a request or account problem."""
 
     code = str(data.get("code") or "")
     message = str(data.get("message") or data.get("error") or "").lower()
-    if code == "4001" or "param is invalid" in message or "invalid param" in message:
+    if (
+        code in {"400", "4001"}
+        or "param is invalid" in message
+        or "invalid param" in message
+    ):
+        return 400
+    # The provider's own error is often wrapped in the SSE message text.
+    embedded = _UPSTREAM_STATUS_RE.search(message)
+    if embedded:
+        status = int(embedded.group(1))
+        if 400 <= status < 500 and status not in {401, 403, 408, 429}:
+            return 400
+        if status in {401, 403, 429}:
+            return status
+    if any(
+        marker in message
+        for marker in ("invalidparameter", "invalid_parameter", "invalid_request_error")
+    ):
         return 400
     return 502
 
@@ -1285,9 +1319,12 @@ def create_openai_router(
                             if retry_after_auth_error(record, exc.status_code):
                                 attempts -= 1
                                 continue
-                            account_router.mark_failure(
-                                record, exc.status_code, str(exc)
-                            )
+                            # A bad model output is not the account's fault:
+                            # retry elsewhere, but leave the account available.
+                            if exc.account_fault:
+                                account_router.mark_failure(
+                                    record, exc.status_code, str(exc)
+                                )
                             continue
                         _record_usage(
                             request_id=request_id,
@@ -1393,9 +1430,10 @@ def create_openai_router(
                     except UpstreamError as exc:
                         status_code = exc.status_code
                         error_text = str(exc)
-                        account_router.mark_failure(
-                            record, exc.status_code, str(exc)
-                        )
+                        if exc.account_fault:
+                            account_router.mark_failure(
+                                record, exc.status_code, str(exc)
+                            )
                         yield _sse(
                             {
                                 "error": {

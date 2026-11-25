@@ -59,26 +59,27 @@ def _split_legacy_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     return "".join(clean), calls
 
 
-_DSML = r"[|｜]\s*[|｜]\s*DSML\s*[|｜]\s*[|｜]"
-_DSML_TAG = r"(?:tool_calls|function_calls|calls)"
-_DSML_CALLS_RE = re.compile(
-    rf"<\s*{_DSML}\s*{_DSML_TAG}\s*>(.*?)</\s*{_DSML}\s*{_DSML_TAG}\s*>",
+_DSML = r"[|｜]\s*[|｜]?\s*DSML\s*[|｜]\s*[|｜]?"
+# One DSML tag, opening or closing: < | | DSML | | parameter name="x" string="true">
+_DSML_TAG_RE = re.compile(
+    rf"<(?P<close>/)?\s*(?:{_DSML})\s*"
+    r"(?P<kind>tool_calls|function_calls|calls|invoke|parameter)\b(?P<attrs>[^>]*)>",
     re.S | re.I,
 )
-_DSML_INVOKE_RE = re.compile(
-    rf"<\s*{_DSML}\s*invoke\s+name=[\"']([^\"']+)[\"'][^>]*>(.*?)</\s*{_DSML}\s*invoke\s*>",
-    re.S | re.I,
-)
-_DSML_PARAM_RE = re.compile(
-    rf"<\s*{_DSML}\s*parameter\s+name=[\"']([^\"']+)[\"']([^>]*)>(.*?)</\s*{_DSML}\s*parameter\s*>",
-    re.S | re.I,
-)
+_DSML_HINT_RE = re.compile("dsml", re.I)
+_DSML_KINDS = {
+    "calls": "calls",
+    "tool_calls": "calls",
+    "function_calls": "calls",
+    "invoke": "invoke",
+    "parameter": "parameter",
+}
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S | re.I)
 _DOUBAO_CALL_RE = re.compile(
     r"<\|FunctionCallBegin\|>\s*(.*?)\s*<\|FunctionCallEnd\|>", re.S | re.I
 )
+# DSML blocks are located by _scan_dsml; these only flag the JSON-style markers.
 _NATIVE_OPEN_RES = (
-    re.compile(rf"<\s*{_DSML}\s*{_DSML_TAG}\s*>", re.I),
     re.compile(r"<tool_call>", re.I),
     re.compile(r"<\|FunctionCallBegin\|>", re.I),
 )
@@ -110,34 +111,162 @@ def _native_call_arguments(raw_arguments: Any) -> dict[str, Any]:
     return {"value": raw_arguments}
 
 
-def _parse_dsml_calls(block: str) -> list[dict[str, Any]]:
+def _dsml_attr(attrs: str, name: str) -> str:
+    match = re.search(rf"\b{name}\s*=\s*[\"']([^\"']*)[\"']", attrs, re.I)
+    return match.group(1).strip() if match else ""
+
+
+def _dsml_argument(invoke: dict[str, Any], name: str, value: Any) -> None:
+    invoke["count"] += 1
+    if name not in {"arguments", "parameters"}:
+        invoke["arguments"][name] = value
+    elif isinstance(value, Mapping):
+        invoke["arguments"].update(value)
+    elif isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, Mapping):
+            invoke["arguments"].update(parsed)
+        else:
+            invoke["arguments"][name] = value
+    else:
+        invoke["arguments"][name] = value
+
+
+def _scan_dsml(
+    text: str, *, final: bool = False
+) -> tuple[str, list[dict[str, Any]], str, bool]:
+    """Split ``text`` into prose, parsed calls and a trailing unclosed block.
+
+    Tags are matched by nesting depth: a closing tag only ends the element of
+    the same kind opened most recently.  A DSML sample quoted inside an
+    argument value therefore stays part of that value instead of cutting the
+    call short.
+
+    The last element flags a call whose argument was still open when the text
+    ended, which is only known once ``final`` is set.
+    """
+
+    prose: list[str] = []
     calls: list[dict[str, Any]] = []
-    for invoke in _DSML_INVOKE_RE.finditer(block):
-        name = invoke.group(1).strip()
-        if not name:
-            continue
-        arguments: dict[str, Any] = {}
-        for parameter in _DSML_PARAM_RE.finditer(invoke.group(2)):
-            param_name = parameter.group(1).strip()
-            value = _native_value(parameter.group(3), parameter.group(2))
-            if param_name in {"arguments", "parameters"}:
-                if isinstance(value, Mapping):
-                    arguments.update(value)
-                elif isinstance(value, str):
-                    try:
-                        parsed = json.loads(value)
-                    except ValueError:
-                        parsed = None
-                    if isinstance(parsed, Mapping):
-                        arguments.update(parsed)
-                    else:
-                        arguments[param_name] = value
-                else:
-                    arguments[param_name] = value
+    stack: list[dict[str, Any]] = []
+    cursor = 0
+    block_start = 0
+    block_calls = 0
+    opened = False
+    tags = list(_DSML_TAG_RE.finditer(text)) if _DSML_HINT_RE.search(text) else []
+
+    def topmost(kind: str) -> int:
+        return next(
+            (
+                index
+                for index in range(len(stack) - 1, -1, -1)
+                if stack[index]["kind"] == kind
+            ),
+            -1,
+        )
+
+    def close(index: int, end: int) -> None:
+        """Close ``stack[index]`` and everything opened inside it, at ``end``."""
+        while len(stack) > index:
+            entry = stack.pop()
+            quoted = bool(stack) and stack[-1]["kind"] == "parameter"
+            if entry["kind"] == "parameter":
+                owner = next(
+                    (item for item in reversed(stack) if item["kind"] == "invoke"),
+                    None,
+                )
+                if entry["name"] and owner is not None and not quoted:
+                    _dsml_argument(
+                        owner,
+                        entry["name"],
+                        _native_value(text[entry["start"] : end], entry["attrs"]),
+                    )
+            elif entry["kind"] == "invoke" and entry["name"] and not quoted:
+                calls.append({"name": entry["name"], "arguments": entry["arguments"]})
+
+    for index, tag in enumerate(tags):
+        kind = _DSML_KINDS[tag.group("kind").lower()]
+        attrs = tag.group("attrs")
+        if tag.group("close") is None:
+            if not stack:
+                if kind != "calls":
+                    continue  # a bare tag outside a block is plain text
+                opened = True
+                block_start, block_calls = tag.start(), len(calls)
+                prose.append(text[cursor:block_start])
+            if kind == "invoke":
+                stack.append(
+                    {
+                        "kind": kind,
+                        "name": _dsml_attr(attrs, "name"),
+                        "arguments": {},
+                        "count": 0,
+                    }
+                )
+            elif kind == "parameter":
+                stack.append(
+                    {
+                        "kind": kind,
+                        "name": _dsml_attr(attrs, "name"),
+                        "start": tag.end(),
+                        "attrs": attrs,
+                    }
+                )
             else:
-                arguments[param_name] = value
-        calls.append({"name": name, "arguments": arguments})
-    return calls
+                stack.append({"kind": kind})
+            continue
+        target = topmost(kind)
+        if target < 0:
+            # A leftover structural tag (a doubled close, a wrapper closed
+            # after its last invoke) is dropped when only whitespace follows
+            # the block.
+            if opened and not stack and not text[cursor : tag.start()].strip():
+                cursor = tag.end()
+            continue
+        parameter = topmost("parameter")
+        if (
+            parameter >= 0
+            and target <= parameter
+            and (parameter == 0 or stack[parameter - 1]["kind"] == "invoke")
+        ):
+            # The tag would end a call argument.  Only trust it when the next
+            # tag is adjacent or closes the block: a closing tag quoted inside
+            # the value is followed by more of that value.
+            following = tags[index + 1] if index + 1 < len(tags) else None
+            if following is None:
+                if not final:
+                    continue
+            elif text[tag.end() : following.start()].strip() and not (
+                following.group("close")
+                and _DSML_KINDS[following.group("kind").lower()] in {"invoke", "calls"}
+            ):
+                continue
+        close(target, tag.start())
+        if not stack:
+            cursor = tag.end()
+
+    if not stack:
+        prose.append(text[cursor:])
+        return "".join(prose), calls, "", False
+    tail = text[block_start:]
+    if not final:
+        return "".join(prose), calls, tail, False
+    if topmost("parameter") >= 0:
+        return "".join(prose), calls, tail, True
+    if len(calls) == block_calls and not any(
+        entry["kind"] == "invoke" and entry["name"] and entry["count"]
+        for entry in stack
+    ):
+        # A wrapper tag quoted in prose, not a call.
+        prose.append(tail)
+        return "".join(prose), calls, "", False
+    for entry in stack:
+        if entry["kind"] == "invoke" and entry["name"] and entry["count"]:
+            calls.append({"name": entry["name"], "arguments": entry["arguments"]})
+    return "".join(prose), calls, "", False
 
 
 def _parse_json_tool_calls(block: str) -> list[dict[str, Any]]:
@@ -170,52 +299,60 @@ def _parse_json_tool_calls(block: str) -> list[dict[str, Any]]:
     return calls
 
 
-def _extract_native_tool_calls(text: str) -> tuple[str, list[dict[str, Any]], str]:
+def _extract_native_tool_calls(
+    text: str, *, final: bool = False
+) -> tuple[str, list[dict[str, Any]], str, bool]:
     """Recover model-native tool markup that leaked into assistant text.
 
     DeepSeek emits ``<｜｜DSML｜｜ calls>...``, Qwen/others emit
     ``<tool_call>{...}</tool_call>`` and Doubao emits
     ``<|FunctionCallBegin|>[...]<|FunctionCallEnd|>``.  Treat these as calls,
     not as user-visible text.
+
+    ``final`` marks the end of the output: DSML blocks still open are then
+    closed where that is safe, and the last element flags a call whose
+    argument was cut off.
     """
 
     calls: list[dict[str, Any]] = []
 
-    def replace_dsml(match: re.Match[str]) -> str:
-        calls.extend(_parse_dsml_calls(match.group(1)))
-        return ""
-
-    text = _DSML_CALLS_RE.sub(replace_dsml, text)
+    # DSML first, so a JSON-style marker quoted inside a DSML argument is
+    # never mistaken for a call of its own.
+    visible, dsml_calls, dsml_tail, truncated = _scan_dsml(text, final=final)
+    calls.extend(dsml_calls)
 
     def replace_tool_call(match: re.Match[str]) -> str:
         calls.extend(_parse_json_tool_calls(match.group(1)))
         return ""
 
-    text = _TOOL_CALL_RE.sub(replace_tool_call, text)
+    visible = _TOOL_CALL_RE.sub(replace_tool_call, visible)
 
     def replace_doubao(match: re.Match[str]) -> str:
         calls.extend(_parse_json_tool_calls(match.group(1)))
         return ""
 
-    text = _DOUBAO_CALL_RE.sub(replace_doubao, text)
+    visible = _DOUBAO_CALL_RE.sub(replace_doubao, visible)
 
-    incomplete = ""
     openings = [
-        (match.start(), match)
+        match.start()
         for pattern in _NATIVE_OPEN_RES
-        for match in pattern.finditer(text)
+        for match in pattern.finditer(visible)
     ]
     if openings:
-        start, match = min(openings, key=lambda item: item[0])
-        incomplete = text[start:]
-        text = text[:start]
-    return text, calls, incomplete
+        start = min(openings)
+        return visible[:start], calls, visible[start:] + dsml_tail, truncated
+    return visible, calls, dsml_tail, truncated
 
 
 class UpstreamError(RuntimeError):
-    def __init__(self, message: str, status_code: int = 502) -> None:
+    def __init__(
+        self, message: str, status_code: int = 502, *, account_fault: bool = True
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        # False when the model's own output is unusable: the account is fine
+        # and must not be cooled down for it.
+        self.account_fault = account_fault
 
 
 def _content_text(content: Any) -> str:
@@ -474,11 +611,6 @@ def normalize_tool_arguments(
             f"tool {name!r} is missing required field(s): {', '.join(missing)}"
         )
     return args
-    try:
-        value = int(os.environ.get("TRAE_MOUTH_MAX_TOOL_SCHEMA_CHARS", "48000"))
-    except (TypeError, ValueError):
-        value = 48000
-    return max(2048, value)
 
 
 def _tool_schema_budget() -> int:
@@ -626,6 +758,7 @@ def build_tool_prompt(
         "To call one or more tools, output only blocks in this exact format and no prose:",
         f'{TOOL_START}{{"name":"tool_name","arguments":{{}}}}{TOOL_END}',
         "The client assigns call ids; do not invent ids. Use an exact declared tool name and arguments matching its schema.",
+        "Keep argument values as plain content: never put tool-call tags or markup inside a value, and describe such markup in words instead.",
         "Wait for the client tool result before continuing. Never claim a client file operation succeeded without a matching tool result.",
         "Lines starting with 'Client tool history' or '[client tool call]' are records of calls that already ran. Never echo, copy, or describe them as a new call.",
         "If another tool is needed, emit another tool-call block now instead of writing text such as 'Now calling ...'.",
@@ -1510,7 +1643,7 @@ def _partial_native_suffix(text: str) -> int:
         return 0
     fragment = text[index:]
     compact = re.sub(r"\s+", "", fragment).lower()
-    if len(compact) < 3:
+    if not compact:
         return 0
     for marker in _NATIVE_MARKERS:
         if marker.startswith(compact):
@@ -1567,21 +1700,21 @@ class ToolBlockFilter:
         self._seen: set[str] = set()
         self.incomplete = ""
         self.native_incomplete = ""
-        self.native_partial = ""
+        self.native_truncated = False
         self.allow_tool_calls = allow_tool_calls
 
-    def release_native_partial(self) -> str:
-        """Return a held partial marker so finalize can emit it as text."""
+    def feed(
+        self, text: str, *, final: bool = False
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Return client-visible text and newly completed calls.
 
-        text = self.native_partial
-        self.native_partial = ""
-        return text
-
-    def feed(self, text: str) -> tuple[str, list[dict[str, Any]]]:
+        ``final`` marks the end of the output: nothing is held back any more
+        and an unfinished call is reported instead of waited for.
+        """
         if not self.allow_tool_calls:
             self.incomplete = ""
             self.native_incomplete = ""
-            self.native_partial = ""
+            self.native_truncated = False
             return text, []
         visible: list[str] = []
         calls: list[dict[str, Any]] = []
@@ -1611,18 +1744,17 @@ class ToolBlockFilter:
             position = end + len(TOOL_END)
         visible_text, legacy_calls = _split_legacy_calls("".join(visible))
         calls.extend(legacy_calls)
-        visible_text, native_calls, native_incomplete = _extract_native_tool_calls(
-            visible_text
+        visible_text, native_calls, native_incomplete, truncated = (
+            _extract_native_tool_calls(visible_text, final=final)
         )
         calls.extend(native_calls)
         self.native_incomplete = native_incomplete
-        if not native_incomplete:
-            hold = _partial_native_suffix(visible_text)
-            if hold:
-                self.native_partial = visible_text[-hold:]
-                visible_text = visible_text[:-hold]
-            else:
-                self.native_partial = ""
+        self.native_truncated = truncated
+        hold = (
+            0 if final or native_incomplete else _partial_native_suffix(visible_text)
+        )
+        if hold:
+            visible_text = visible_text[:-hold]
         new_calls: list[dict[str, Any]] = []
         for call in calls:
             key = json.dumps(call, sort_keys=True, ensure_ascii=False)

@@ -525,6 +525,29 @@ def test_translator_repairs_tool_arguments() -> None:
     assert json.loads(call["function"]["arguments"]) == {"x": 7}
 
 
+def test_invalid_tool_arguments_are_request_errors() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+        "required": ["file_path"],
+    }
+    translator = OpenAIStreamTranslator(
+        "test-model",
+        tools_expected=True,
+        tool_schemas={"Read": schema},
+        strict_tool_args=True,
+    )
+    block = (
+        "<trae_mouth_tool_call>"
+        '{"name":"Read","arguments":{"path":"a.py"}}'
+        "</trae_mouth_tool_call>"
+    )
+    with pytest.raises(UpstreamError) as info:
+        translator.feed({"event": "output", "data": {"response": block}})
+    assert info.value.status_code == 400
+    assert "file_path" in str(info.value)
+
+
 def test_translator_requires_tool_call_when_requested() -> None:
     translator = OpenAIStreamTranslator(
         "test-model",
@@ -742,3 +765,364 @@ def test_chat_empty_response_retries_without_cooldown(config) -> None:
         assert response.json()["trae"]["account_id"] == second.id
         assert store.get(first_id).status == "active"
         assert len(seen_tokens) == 2
+
+
+def collect_deltas(chunks: list[str]) -> tuple[str, list[tuple[str, dict]]]:
+    content = ""
+    calls: list[tuple[str, dict]] = []
+    for chunk in chunks:
+        if not chunk.startswith("data: {"):
+            continue
+        for choice in json.loads(chunk[6:].strip())["choices"]:
+            delta = choice.get("delta") or {}
+            content += delta.get("content") or ""
+            for call in delta.get("tool_calls") or []:
+                calls.append(
+                    (call["function"]["name"], json.loads(call["function"]["arguments"]))
+                )
+    return content, calls
+
+
+def translate(pieces: list[str], **options) -> tuple[str, list[tuple[str, dict]]]:
+    translator = OpenAIStreamTranslator("test-model", **options)
+    chunks: list[str] = []
+    for piece in pieces:
+        chunks.extend(translator.feed({"event": "output", "data": {"response": piece}}))
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    chunks.extend(translator.finalize())
+    return collect_deltas(chunks)
+
+
+def test_translator_delivers_call_whose_argument_quotes_dsml() -> None:
+    sample = (
+        '<||DSML||invoke name="Read">'
+        '<||DSML||parameter name="file_path" string="true">a.py'
+        "</||DSML||parameter></||DSML||invoke>"
+    )
+    block = (
+        "我来改。\n< | | DSML | | tool_calls>\n"
+        '< | | DSML | | invoke name="Edit">\n'
+        "< | | DSML | | parameter name=\"file_path\" string=\"true\">"
+        "tests/x.py</ | | DSML | | parameter>\n"
+        "< | | DSML | | parameter name=\"old_string\" string=\"true\">"
+        f"old = '{sample}'\n"
+        "</ | | DSML | | parameter>\n"
+        "< | | DSML | | parameter name=\"new_string\" string=\"true\">"
+        "new</ | | DSML | | parameter>\n"
+        "</ | | DSML | | invoke>\n</ | | DSML | | invoke>"
+    )
+    content, calls = translate(
+        [block[:60], block[60:140], block[140:]],
+        tools_expected=True,
+        tool_schemas={
+            "Edit": {
+                "type": "object",
+                "properties": {
+                    name: {"type": "string"}
+                    for name in ("file_path", "old_string", "new_string")
+                },
+                "required": ["file_path", "old_string", "new_string"],
+            }
+        },
+        strict_tool_args=True,
+    )
+    assert content == "我来改。\n"
+    assert calls == [
+        (
+            "Edit",
+            {
+                "file_path": "tests/x.py",
+                "old_string": f"old = '{sample}'\n",
+                "new_string": "new",
+            },
+        )
+    ]
+
+
+def test_translator_does_not_leak_held_marker_at_finalize() -> None:
+    content, calls = translate(
+        [
+            "我把工具调用链路重新过一遍。\n\n",
+            "< | | DS",
+            "ML | | tool_",
+            'calls>\n< | | DSML | | invoke name="Bash">',
+            "< | | DSML | | parameter name=\"command\" string=\"true\">"
+            "echo hi</ | | DSML | | parameter>",
+            "\n</ | | DSML | | invoke>",
+        ],
+        tools_expected=True,
+    )
+    assert content == "我把工具调用链路重新过一遍。\n\n"
+    assert calls == [("Bash", {"command": "echo hi"})]
+
+
+def test_translator_keeps_quoted_call_marker_as_text() -> None:
+    content, calls = translate(
+        ["格式是 <tool_call> 这样写\n", "结束"], tools_expected=True
+    )
+    assert content == "格式是 <tool_call> 这样写\n结束"
+    assert calls == []
+
+
+def test_translator_truncated_native_call_is_not_account_fault() -> None:
+    translator = OpenAIStreamTranslator("test-model", tools_expected=True)
+    translator.feed(
+        {
+            "event": "output",
+            "data": {
+                "response": (
+                    "<||DSML||tool_calls>"
+                    '<||DSML||invoke name="Edit">'
+                    '<||DSML||parameter name="new_string" string="true">half'
+                )
+            },
+        }
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    with pytest.raises(UpstreamError) as info:
+        translator.finalize()
+    assert "truncated" in str(info.value)
+    assert info.value.account_fault is False
+
+
+def test_model_output_errors_are_not_account_faults() -> None:
+    required = OpenAIStreamTranslator(
+        "test-model", tools_expected=True, tools_required=True
+    )
+    required.feed({"event": "output", "data": {"response": "plain answer"}})
+    required.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    with pytest.raises(UpstreamError) as info:
+        required.finalize()
+    assert info.value.account_fault is False
+
+    empty = OpenAIStreamTranslator("test-model", tools_expected=True)
+    empty.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    with pytest.raises(UpstreamError) as info:
+        empty.finalize()
+    assert info.value.account_fault is False
+
+    schema = {
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+        "required": ["file_path"],
+    }
+    invalid = OpenAIStreamTranslator(
+        "test-model",
+        tools_expected=True,
+        tool_schemas={"Read": schema},
+        strict_tool_args=True,
+    )
+    with pytest.raises(UpstreamError) as info:
+        invalid.feed(
+            {
+                "event": "output",
+                "data": {
+                    "response": (
+                        "<||DSML||tool_calls>"
+                        '<||DSML||invoke name="Read">'
+                        '<||DSML||parameter name="path" string="true">'
+                        "a.py</||DSML||parameter>"
+                        "</||DSML||invoke></||DSML||tool_calls>"
+                    )
+                },
+            }
+        )
+    assert info.value.status_code == 400
+    assert info.value.account_fault is False
+
+
+def test_upstream_error_with_embedded_status_is_classified() -> None:
+    assert (
+        _upstream_error_status(
+            {
+                "message": (
+                    'model service is unavailable Error code: 400 - '
+                    '{"code":"InvalidParameter"}'
+                )
+            }
+        )
+        == 400
+    )
+    assert _upstream_error_status({"message": "Error code: 404 - no model"}) == 400
+    assert _upstream_error_status({"message": "Error code: 429 - busy"}) == 429
+    assert _upstream_error_status({"message": "Error code: 401 - expired"}) == 401
+    assert _upstream_error_status({"message": "Error code: 500 - down"}) == 502
+
+
+def test_chat_bad_model_output_retries_without_cooldown(config) -> None:
+    config.api_key = "test-key"
+    truncated = sse(
+        (
+            "output",
+            {
+                "response": (
+                    "<||DSML||tool_calls>"
+                    '<||DSML||invoke name="Edit">'
+                    '<||DSML||parameter name="new_string" string="true">half'
+                )
+            },
+        ),
+        ("done", {"finish_reason": "stop"}),
+    )
+    good = sse(("output", {"response": "ok"}), ("done", {"finish_reason": "stop"}))
+    seen_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/llm_raw_chat"):
+            seen_tokens.append(request.headers.get("authorization", ""))
+            content = truncated if len(seen_tokens) == 1 else good
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=content,
+            )
+        return httpx.Response(500, text="unexpected")
+
+    app = create_app(config, transport=httpx.MockTransport(handler))
+    client = TestClient(app)
+    with client:
+        first_id = prepare(app, client)
+        store = app.state.accounts
+        token = make_jwt({"data": {"id": "user-2"}, "exp": 4102444800})
+        second, _ = store.add_manual(
+            token=token,
+            user_id="user-2",
+            refresh_token="refresh-2",
+            token_expires_at=int(time.time()) + 86400,
+            device=build_device(),
+        )
+        app.state.catalog_cache.put(
+            second.id, dict(app.state.catalog_cache.get(first_id) or {})
+        )
+        response = client.post(
+            "/v1/chat/completions",
+            headers=auth(config),
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "edit it"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "Edit",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"new_string": {"type": "string"}},
+                                "required": ["new_string"],
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["message"]["content"] == "ok"
+        assert response.json()["trae"]["account_id"] == second.id
+        assert store.get(first_id).status == "active"
+        assert len(seen_tokens) == 2
+
+
+def test_chat_stream_invalid_arguments_keep_account_active(config) -> None:
+    content = sse(
+        (
+            "output",
+            {
+                "response": (
+                    "<||DSML||tool_calls>"
+                    '<||DSML||invoke name="Read">'
+                    '<||DSML||parameter name="path" string="true">'
+                    "a.py</||DSML||parameter>"
+                    "</||DSML||invoke></||DSML||tool_calls>"
+                )
+            },
+        ),
+        ("done", {"finish_reason": "stop"}),
+    )
+    app, client = make_client(config, content, [])
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "Read",
+            "parameters": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            },
+        },
+    }
+    with client:
+        first_id = prepare(app, client)
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            headers=auth(config),
+            json={
+                "model": "test-model",
+                "stream": True,
+                "messages": [{"role": "user", "content": "read it"}],
+                "tools": [tool],
+            },
+        ) as response:
+            assert response.status_code == 200
+            body = "".join(response.iter_text())
+        assert '"error"' in body
+        assert "file_path" in body
+        assert "data: [DONE]" in body
+        assert app.state.accounts.get(first_id).status == "active"
+
+
+def test_chat_request_level_upstream_error_does_not_cool_accounts(config) -> None:
+    config.api_key = "test-key"
+    bad = sse(
+        (
+            "error",
+            {
+                "message": (
+                    "model service is unavailable Error code: 400 - "
+                    '{"code":"InvalidParameter"}'
+                )
+            },
+        )
+    )
+    seen_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/llm_raw_chat"):
+            seen_tokens.append(request.headers.get("authorization", ""))
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=bad,
+            )
+        return httpx.Response(500, text="unexpected")
+
+    app = create_app(config, transport=httpx.MockTransport(handler))
+    client = TestClient(app)
+    with client:
+        account_ids = [prepare(app, client)]
+        store = app.state.accounts
+        for index in (2, 3):
+            token = make_jwt({"data": {"id": f"user-{index}"}, "exp": 4102444800})
+            record, _ = store.add_manual(
+                token=token,
+                user_id=f"user-{index}",
+                refresh_token=f"refresh-{index}",
+                token_expires_at=int(time.time()) + 86400,
+                device=build_device(),
+            )
+            app.state.catalog_cache.put(
+                record.id, dict(app.state.catalog_cache.get(account_ids[0]) or {})
+            )
+            account_ids.append(record.id)
+        response = client.post(
+            "/v1/chat/completions",
+            headers=auth(config),
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 400
+        assert "InvalidParameter" in response.text
+        assert len(seen_tokens) == 1
+        assert all(store.get(item).status == "active" for item in account_ids)
