@@ -72,6 +72,50 @@ def test_tool_block_filter_recovers_native_dsml_call() -> None:
     assert calls == [{"name": "read_big_file", "arguments": {}}]
 
 
+def test_tool_block_filter_recovers_dsml_tool_calls_tag() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    text = (
+        "<||DSML||tool_calls>\n"
+        '<||DSML||invoke name="Read">\n'
+        '<||DSML||parameter name="file_path" string="true">a.py</||DSML||parameter>\n'
+        "</||DSML||invoke>\n"
+        "</||DSML||tool_calls>"
+    )
+    visible, calls = flt.feed(text)
+    assert visible == ""
+    assert calls == [{"name": "Read", "arguments": {"file_path": "a.py"}}]
+
+
+def test_tool_block_filter_recovers_spaced_dsml_marker() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    text = (
+        "< | | DSML | | tool_calls>\n"
+        '< | | DSML | | invoke name="Read">\n'
+        '< | | DSML | | parameter name="file_path" string="true">b.py</ | | DSML | | parameter>\n'
+        "</ | | DSML | | invoke>\n"
+        "</ | | DSML | | tool_calls>"
+    )
+    visible, calls = flt.feed(text)
+    assert visible == ""
+    assert calls == [{"name": "Read", "arguments": {"file_path": "b.py"}}]
+
+
+def test_tool_block_filter_holds_partial_dsml_marker() -> None:
+    flt = ide_chat.ToolBlockFilter()
+    visible, calls = flt.feed("先看一下 <||DSML||tool_")
+    assert visible == "先看一下 "
+    assert calls == []
+
+    visible, calls = flt.feed(
+        "先看一下 <||DSML||tool_calls>"
+        '<||DSML||invoke name="Read">'
+        '<||DSML||parameter name="file_path" string="true">c.py</||DSML||parameter>'
+        "</||DSML||invoke></||DSML||tool_calls>"
+    )
+    assert visible == "先看一下 "
+    assert calls == [{"name": "Read", "arguments": {"file_path": "c.py"}}]
+
+
 def test_tool_block_filter_recovers_native_tool_call_json() -> None:
     flt = ide_chat.ToolBlockFilter()
     text = (

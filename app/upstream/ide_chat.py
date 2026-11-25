@@ -59,9 +59,11 @@ def _split_legacy_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
     return "".join(clean), calls
 
 
-_DSML = r"[|｜]{2}\s*DSML\s*[|｜]{2}"
+_DSML = r"[|｜]\s*[|｜]\s*DSML\s*[|｜]\s*[|｜]"
+_DSML_TAG = r"(?:tool_calls|function_calls|calls)"
 _DSML_CALLS_RE = re.compile(
-    rf"<\s*{_DSML}\s*calls\s*>(.*?)</\s*{_DSML}\s*calls\s*>", re.S | re.I
+    rf"<\s*{_DSML}\s*{_DSML_TAG}\s*>(.*?)</\s*{_DSML}\s*{_DSML_TAG}\s*>",
+    re.S | re.I,
 )
 _DSML_INVOKE_RE = re.compile(
     rf"<\s*{_DSML}\s*invoke\s+name=[\"']([^\"']+)[\"'][^>]*>(.*?)</\s*{_DSML}\s*invoke\s*>",
@@ -76,7 +78,7 @@ _DOUBAO_CALL_RE = re.compile(
     r"<\|FunctionCallBegin\|>\s*(.*?)\s*<\|FunctionCallEnd\|>", re.S | re.I
 )
 _NATIVE_OPEN_RES = (
-    re.compile(rf"<\s*{_DSML}\s*calls\s*>", re.I),
+    re.compile(rf"<\s*{_DSML}\s*{_DSML_TAG}\s*>", re.I),
     re.compile(r"<tool_call>", re.I),
     re.compile(r"<\|FunctionCallBegin\|>", re.I),
 )
@@ -1491,6 +1493,31 @@ def _partial_marker_suffix(text: str, marker: str) -> int:
     return 0
 
 
+_NATIVE_MARKERS = (
+    "<||dsml||tool_calls>",
+    "<||dsml||function_calls>",
+    "<||dsml||calls>",
+    "<tool_call>",
+    "<|functioncallbegin|>",
+)
+
+
+def _partial_native_suffix(text: str) -> int:
+    """Length of a trailing fragment that may become a native call marker."""
+
+    index = text.rfind("<")
+    if index < 0:
+        return 0
+    fragment = text[index:]
+    compact = re.sub(r"\s+", "", fragment).lower()
+    if len(compact) < 3:
+        return 0
+    for marker in _NATIVE_MARKERS:
+        if marker.startswith(compact):
+            return len(fragment)
+    return 0
+
+
 def _parse_tool_block(block: str) -> list[dict[str, Any]]:
     block = block.strip()
     if not block:
@@ -1540,12 +1567,21 @@ class ToolBlockFilter:
         self._seen: set[str] = set()
         self.incomplete = ""
         self.native_incomplete = ""
+        self.native_partial = ""
         self.allow_tool_calls = allow_tool_calls
+
+    def release_native_partial(self) -> str:
+        """Return a held partial marker so finalize can emit it as text."""
+
+        text = self.native_partial
+        self.native_partial = ""
+        return text
 
     def feed(self, text: str) -> tuple[str, list[dict[str, Any]]]:
         if not self.allow_tool_calls:
             self.incomplete = ""
             self.native_incomplete = ""
+            self.native_partial = ""
             return text, []
         visible: list[str] = []
         calls: list[dict[str, Any]] = []
@@ -1580,6 +1616,13 @@ class ToolBlockFilter:
         )
         calls.extend(native_calls)
         self.native_incomplete = native_incomplete
+        if not native_incomplete:
+            hold = _partial_native_suffix(visible_text)
+            if hold:
+                self.native_partial = visible_text[-hold:]
+                visible_text = visible_text[:-hold]
+            else:
+                self.native_partial = ""
         new_calls: list[dict[str, Any]] = []
         for call in calls:
             key = json.dumps(call, sort_keys=True, ensure_ascii=False)

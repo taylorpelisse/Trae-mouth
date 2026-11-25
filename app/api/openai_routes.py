@@ -535,6 +535,10 @@ class OpenAIStreamTranslator:
 
     def _finalize_calls(self) -> str:
         visible, new_calls = self.filter.feed(self.response.text)
+        partial = self.filter.release_native_partial()
+        if partial:
+            # A trailing fragment that never became a call marker is text.
+            visible += partial
         incomplete = self.filter.incomplete
         if incomplete:
             if ide_chat.TOOL_START.startswith(incomplete):
