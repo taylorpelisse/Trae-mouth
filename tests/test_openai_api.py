@@ -9,7 +9,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.accounts.models import build_device
-from app.api.openai_routes import OpenAIStreamTranslator, _preflight_stream
+from app.api.openai_routes import (
+    OpenAIStreamTranslator,
+    _preflight_stream,
+    _upstream_error_status,
+)
 from app.main import create_app
 from app.upstream.ide_chat import UpstreamError
 from tests.conftest import make_jwt
@@ -629,6 +633,67 @@ def test_preflight_returns_on_first_payload() -> None:
     buffered, ok = asyncio.run(_preflight_stream(events(), 5))
     assert ok is True
     assert buffered[-1]["data"]["response"] == "hi"
+
+
+def test_upstream_param_error_is_request_level() -> None:
+    assert (
+        _upstream_error_status(
+            {"code": 4001, "message": "We're sorry, the param is invalid."}
+        )
+        == 400
+    )
+    assert _upstream_error_status({"code": 9999, "message": "upstream down"}) == 502
+
+
+def test_chat_stops_after_repeated_upstream_error(config) -> None:
+    config.api_key = "test-key"
+    config.account_failover_limit = 5
+    repeated = sse(("error", {"code": 9999, "message": "same failure"}))
+    seen_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/llm_raw_chat"):
+            seen_tokens.append(request.headers.get("authorization", ""))
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=repeated,
+            )
+        return httpx.Response(500, text="unexpected")
+
+    app = create_app(config, transport=httpx.MockTransport(handler))
+    client = TestClient(app)
+    with client:
+        first_id = prepare(app, client)
+        store = app.state.accounts
+        extra_ids: list[str] = []
+        for index in (2, 3):
+            token = make_jwt({"data": {"id": f"user-{index}"}, "exp": 4102444800})
+            record, _ = store.add_manual(
+                token=token,
+                user_id=f"user-{index}",
+                refresh_token=f"refresh-{index}",
+                token_expires_at=int(time.time()) + 86400,
+                device=build_device(),
+            )
+            app.state.catalog_cache.put(
+                record.id, dict(app.state.catalog_cache.get(first_id) or {})
+            )
+            extra_ids.append(record.id)
+        response = client.post(
+            "/v1/chat/completions",
+            headers=auth(config),
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "same error"}],
+            },
+        )
+        assert response.status_code == 502
+        assert "same failure" in response.text
+        assert len(seen_tokens) == 2
+        assert store.get(first_id).status == "cooldown"
+        assert store.get(extra_ids[0]).status == "active"
+        assert store.get(extra_ids[1]).status == "active"
 
 
 def test_chat_empty_response_retries_without_cooldown(config) -> None:

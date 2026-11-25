@@ -422,7 +422,7 @@ class OpenAIStreamTranslator:
             code = data.get("code")
             if code not in (None, "", 0):
                 message = f"{message} (code {code})"
-            raise UpstreamError(message)
+            raise UpstreamError(message, status_code=_upstream_error_status(data))
         if name == "token_usage":
             self.usage = map_usage(data.get("usage") or data)
             return chunks
@@ -692,6 +692,16 @@ class OpenAIStreamTranslator:
         }
 
 
+def _upstream_error_status(data: Mapping[str, Any]) -> int:
+    """Classify an upstream SSE error as a request or account problem."""
+
+    code = str(data.get("code") or "")
+    message = str(data.get("message") or data.get("error") or "").lower()
+    if code == "4001" or "param is invalid" in message or "invalid param" in message:
+        return 400
+    return 502
+
+
 async def _preflight_stream(
     stream: AsyncIterator[dict[str, Any]],
     timeout: int,
@@ -714,7 +724,9 @@ async def _preflight_stream(
         data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
         if name == "error":
             message = str(data.get("message") or data.get("error") or "upstream error")
-            raise UpstreamError(message, status_code=502)
+            raise UpstreamError(
+                message, status_code=_upstream_error_status(data)
+            )
         if name == "queue_continue":
             raise UpstreamError(
                 "upstream requested a queued retry before first token",
@@ -1065,6 +1077,26 @@ def create_openai_router(
         attempts = 0
         last_error: Optional[BaseException] = None
         last_catalog: dict[str, Any] = {}
+        last_failure: Optional[tuple[int, str]] = None
+        same_failure = 0
+
+        def repeated_failure(exc: UpstreamError) -> bool:
+            """Stop failover when consecutive accounts report the same error."""
+
+            nonlocal last_failure, same_failure
+            if not (
+                exc.status_code == 0
+                or exc.status_code == 429
+                or exc.status_code >= 500
+            ):
+                return False
+            signature = (exc.status_code, str(exc).strip())
+            if signature == last_failure:
+                same_failure += 1
+            else:
+                last_failure = signature
+                same_failure = 1
+            return same_failure >= 2
 
         def retry_after_auth_error(record: Any, status_code: int) -> bool:
             """Refresh an account once on 401/403 and let the loop retry it."""
@@ -1244,6 +1276,8 @@ def create_openai_router(
                             continue
                         last_error = exc
                         if _should_failover_status(exc.status_code):
+                            if repeated_failure(exc):
+                                break
                             if retry_after_auth_error(record, exc.status_code):
                                 attempts -= 1
                                 continue
@@ -1289,6 +1323,8 @@ def create_openai_router(
                 except UpstreamError as exc:
                     last_error = exc
                     if _should_failover_status(exc.status_code):
+                        if repeated_failure(exc):
+                            break
                         if retry_after_auth_error(record, exc.status_code):
                             attempts -= 1
                             continue

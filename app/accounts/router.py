@@ -31,7 +31,26 @@ class AccountRouter:
         self._cursor = 0
 
     def active(self) -> list[AccountRecord]:
-        return [record for record in self.store.list() if record.status == STATUS_ACTIVE]
+        now = now_ts()
+        result: list[AccountRecord] = []
+        for record in self.store.list():
+            if record.status == STATUS_ACTIVE:
+                result.append(record)
+                continue
+            if (
+                record.status == STATUS_COOLDOWN
+                and record.cooldown_until
+                and record.cooldown_until <= now
+            ):
+                # Cooldowns expire on their own; do not wait for the refresher.
+                self.store.set_status(
+                    record.id, STATUS_ACTIVE, "", actor="account-router"
+                )
+                record.status = STATUS_ACTIVE
+                record.status_reason = ""
+                record.cooldown_until = None
+                result.append(record)
+        return result
 
     def acquire(self, account_id: str) -> None:
         with self._lock:
