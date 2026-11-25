@@ -29,7 +29,7 @@ export default {
       },
       boxShadow: {
         soft: "0 1px 0 rgba(20,40,30,0.05)",
-        dock: "0 12px 40px rgba(20,40,30,0.12)",
+        dock: "0 18px 50px rgba(20,40,30,0.18), 0 6px 18px rgba(20,40,30,0.10)",
       },
       fontSize: {
         "13": ["13px", "20px"],

@@ -105,6 +105,8 @@ def create_admin_console_router(
             "default_concurrency": config.default_concurrency,
             "account_max_concurrency": config.default_concurrency,
             "account_cooldown_seconds": config.account_cooldown,
+            "account_failover_limit": config.account_failover_limit,
+            "first_token_timeout": config.first_token_timeout,
             "session_sticky_ttl": config.conversation_affinity_ttl,
             "token_refresh_enabled": True,
             "token_refresh_margin": config.refresh_window,
@@ -116,6 +118,9 @@ def create_admin_console_router(
             "global_ide": config.global_ide,
             "prewarm_catalogs": config.prewarm_catalogs,
             "max_request_bytes": config.max_request_bytes,
+            "tool_result_max_chars": config.tool_result_max_chars,
+            "history_max_chars": config.history_max_chars,
+            "history_max_messages": config.history_max_messages,
             "model_gateway": config.model_gateway,
             "auth_host": config.trae_auth_host,
             "client_id": config.trae_client_id,
@@ -891,7 +896,7 @@ def create_admin_console_router(
 
     @router.patch("/settings")
     def patch_settings(
-        body: SettingsPatchBody, user_id: str = Depends(current_admin)
+        body: SettingsPatchBody, _: str = Depends(current_admin)
     ) -> dict[str, Any]:
         changed: list[str] = []
         values = body.values or {}
@@ -900,6 +905,8 @@ def create_admin_console_router(
             "account_max_concurrency",
             "account_cooldown",
             "account_cooldown_seconds",
+            "account_failover_limit",
+            "first_token_timeout",
             "model_catalog_ttl",
             "refresh_interval",
             "reasoning_as_content",
@@ -909,6 +916,9 @@ def create_admin_console_router(
             "native_tools",
             "prewarm_catalogs",
             "max_request_bytes",
+            "tool_result_max_chars",
+            "history_max_chars",
+            "history_max_messages",
             "model_gateway",
             "web_api_base",
         }
@@ -919,7 +929,7 @@ def create_admin_console_router(
             )
         for key, value in values.items():
             if key in {"default_concurrency", "account_max_concurrency"}:
-                number = max(1, min(32, int(value)))
+                number = max(1, int(value))
                 config.default_concurrency = number
                 accounts.default_concurrency = number
                 for record in accounts.list():
@@ -928,6 +938,15 @@ def create_admin_console_router(
                 number = max(30, int(value))
                 config.account_cooldown = number
                 account_router.cooldown = number
+            elif key == "account_failover_limit":
+                max_failover = max(0, len(accounts.list()) - 1)
+                config.account_failover_limit = max(
+                    0, min(max_failover, int(value))
+                )
+                values[key] = config.account_failover_limit
+            elif key == "first_token_timeout":
+                config.first_token_timeout = max(10, min(600, int(value)))
+                values[key] = config.first_token_timeout
             elif key == "model_catalog_ttl":
                 number = max(10, int(value))
                 config.model_catalog_ttl = number
@@ -938,6 +957,19 @@ def create_admin_console_router(
                 refresher.interval = config.refresh_interval
             elif key == "max_request_bytes":
                 config.max_request_bytes = max(1024, int(value))
+            elif key == "tool_result_max_chars":
+                config.tool_result_max_chars = max(
+                    1000, min(1_000_000, int(value))
+                )
+                values[key] = config.tool_result_max_chars
+            elif key == "history_max_chars":
+                config.history_max_chars = max(
+                    10_000, min(10_000_000, int(value))
+                )
+                values[key] = config.history_max_chars
+            elif key == "history_max_messages":
+                config.history_max_messages = max(0, min(1000, int(value)))
+                values[key] = config.history_max_messages
             elif key == "global_ide":
                 config.global_ide = bool(value)
             elif key == "native_tools":
@@ -963,6 +995,8 @@ def create_admin_console_router(
             "native_tools",
             "default_concurrency",
             "account_cooldown",
+            "account_failover_limit",
+            "first_token_timeout",
             "model_catalog_ttl",
             "refresh_interval",
             "reasoning_as_content",
@@ -970,6 +1004,9 @@ def create_admin_console_router(
             "tool_duplicate_warning",
             "prewarm_catalogs",
             "max_request_bytes",
+            "tool_result_max_chars",
+            "history_max_chars",
+            "history_max_messages",
             "model_gateway",
             "web_api_base",
         }
@@ -977,7 +1014,6 @@ def create_admin_console_router(
             target = persist_map.get(key, key)
             if target in persist_keys:
                 db.set_setting("config:" + target, json.dumps(values[key]))
-        admin.audit(user_id, "settings_patch", ",".join(changed))
         return {
             "ok": True,
             "success": True,

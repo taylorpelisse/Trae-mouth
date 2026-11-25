@@ -199,6 +199,17 @@ export type CreditSummary = {
   entries: CreditEntry[];
 };
 
+export type UpdateInfo = {
+  ok: boolean;
+  current: string;
+  latest: string;
+  available: boolean;
+  notes?: string;
+  release_url?: string;
+  published_at?: string;
+  error?: string;
+};
+
 export type PlaygroundResult = {
   content: string;
   reasoning: string;

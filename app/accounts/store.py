@@ -111,7 +111,7 @@ class AccountStore:
         self,
         db: Database,
         secrets: SecretBox,
-        default_concurrency: int = 2,
+        default_concurrency: int = 3,
     ) -> None:
         self.db = db
         self.secrets = secrets

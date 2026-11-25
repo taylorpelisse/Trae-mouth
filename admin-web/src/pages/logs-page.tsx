@@ -78,7 +78,7 @@ export function LogsPage() {
               : ""
         }`,
       ),
-    refetchInterval: 30_000,
+    refetchInterval: 500,
   });
   const keysQuery = useQuery({
     queryKey: ["admin", "keys"],

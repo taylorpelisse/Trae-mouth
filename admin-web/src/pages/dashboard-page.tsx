@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
+  ArrowUp,
   ArrowUpRight,
   Clock3,
   Coins,
@@ -22,7 +23,7 @@ import {
   YAxis,
 } from "recharts";
 import { apiGet } from "../lib/api";
-import type { Account, CreditSummary, DashboardMetrics } from "../lib/types";
+import type { Account, CreditSummary, DashboardMetrics, UpdateInfo } from "../lib/types";
 import { formatDuration, formatMillion, formatNumber } from "../lib/format";
 import { Button } from "../components/ui/button";
 import { SectionCard } from "../components/ui/card";
@@ -49,8 +50,8 @@ function healthQuery() {
         mode?: string;
       };
     },
-    refetchInterval: 30_000,
-    staleTime: 10_000,
+    refetchInterval: 500,
+    staleTime: 0,
   };
 }
 
@@ -109,12 +110,12 @@ export function DashboardPage() {
   const metrics = useQuery({
     queryKey: ["admin", "metrics", "14d"],
     queryFn: () => apiGet<DashboardMetrics>("/metrics?range=14d", { silent: true }),
-    refetchInterval: 30_000,
+    refetchInterval: 500,
   });
   const accounts = useQuery({
     queryKey: ["admin", "accounts"],
     queryFn: () => apiGet<{ ok: boolean; accounts: Account[] }>("/accounts"),
-    refetchInterval: 30_000,
+    refetchInterval: 500,
   });
   const credits = useQuery({
     queryKey: ["admin", "credits"],
@@ -131,6 +132,12 @@ export function DashboardPage() {
     refetchInterval: 60_000,
   });
   const health = useQuery(healthQuery());
+  const update = useQuery({
+    queryKey: ["admin", "update"],
+    queryFn: () => apiGet<UpdateInfo>("/update", { silent: true }),
+    refetchInterval: 3_600_000,
+    staleTime: 3_600_000,
+  });
 
   const rows = accounts.data?.accounts ?? [];
   const enabled = rows.filter((row) => row.status !== "disabled").length;
@@ -346,7 +353,19 @@ export function DashboardPage() {
               >
                 <dt className="text-muted">{label}</dt>
                 <dd className={label === "运行模式" ? "font-medium text-accent" : "text-ink"}>
-                  {value}
+                  <span className="inline-flex items-center gap-1.5">
+                    {value}
+                    {label === "服务版本" && update.data?.available ? (
+                      <Link
+                        to="/settings"
+                        aria-label={`发现新版本 ${update.data.latest}`}
+                        title={`发现新版本 ${update.data.latest}，点击前往更新`}
+                        className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-accent/10 text-accent transition-colors hover:bg-accent hover:text-white"
+                      >
+                        <ArrowUp className="h-3.5 w-3.5" />
+                      </Link>
+                    ) : null}
+                  </span>
                 </dd>
               </div>
             ))}

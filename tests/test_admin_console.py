@@ -66,6 +66,21 @@ def test_admin_console_read_endpoints(config) -> None:
 
         settings = client.get("/admin/api/settings").json()
         assert settings["settings"]["version"]
+        assert settings["settings"]["account_failover_limit"] == (
+            app.state.config.account_failover_limit
+        )
+        assert settings["settings"]["first_token_timeout"] == (
+            app.state.config.first_token_timeout
+        )
+        assert settings["settings"]["tool_result_max_chars"] == (
+            app.state.config.tool_result_max_chars
+        )
+        assert settings["settings"]["history_max_chars"] == (
+            app.state.config.history_max_chars
+        )
+        assert settings["settings"]["history_max_messages"] == (
+            app.state.config.history_max_messages
+        )
         patched = client.patch(
             "/admin/api/settings",
             headers=headers,
@@ -74,6 +89,35 @@ def test_admin_console_read_endpoints(config) -> None:
         assert patched.status_code == 200, patched.text
         assert patched.json()["changed"] == ["default_concurrency"]
         assert app.state.config.default_concurrency == 3
+
+        patched = client.patch(
+            "/admin/api/settings",
+            headers=headers,
+            json={
+                "values": {
+                    "account_failover_limit": 4,
+                    "first_token_timeout": 90,
+                    "tool_result_max_chars": 50000,
+                    "history_max_chars": 500000,
+                    "history_max_messages": 20,
+                }
+            },
+        )
+        assert patched.status_code == 200, patched.text
+        assert set(patched.json()["changed"]) == {
+            "account_failover_limit",
+            "first_token_timeout",
+            "tool_result_max_chars",
+            "history_max_chars",
+            "history_max_messages",
+        }
+        assert app.state.config.account_failover_limit == max(
+            0, len(app.state.accounts.list()) - 1
+        )
+        assert app.state.config.first_token_timeout == 90
+        assert app.state.config.tool_result_max_chars == 50000
+        assert app.state.config.history_max_chars == 500000
+        assert app.state.config.history_max_messages == 20
 
         credits = client.get("/admin/api/credits").json()
         assert credits["supported"] is True

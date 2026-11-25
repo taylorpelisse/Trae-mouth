@@ -1019,13 +1019,8 @@ def create_openai_router(
                 error="no active account",
             )
             raise HTTPException(status_code=503, detail="no active account")
-        max_attempts = max(
-            1,
-            min(
-                len(active),
-                int(config.account_failover_limit or 1),
-            ),
-        )
+        failovers = max(0, int(config.account_failover_limit or 0))
+        max_attempts = min(len(active), failovers + 1)
         exclude: set[str] = set()
         refreshed: set[str] = set()
         attempts = 0

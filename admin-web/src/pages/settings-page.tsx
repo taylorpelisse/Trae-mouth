@@ -1,9 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Save } from "lucide-react";
 import { toast } from "sonner";
 import { apiGet, apiPatch, apiPost } from "../lib/api";
-import type { AdminSettings, ConcurrencyInfo, InstanceInfo } from "../lib/types";
+import type {
+  AdminSettings,
+  ConcurrencyInfo,
+  InstanceInfo,
+  UpdateInfo,
+} from "../lib/types";
 import { formatTime } from "../lib/format";
 import { Button } from "../components/ui/button";
 import { SectionCard } from "../components/ui/card";
@@ -23,16 +27,18 @@ const BOOLEAN_KEYS = [
   "strict_tool_args",
   "tool_duplicate_warning",
   "global_ide",
+  "prewarm_catalogs",
   "native_tools",
 ] as const;
 
 export function SettingsPage() {
   const queryClient = useQueryClient();
   const [values, setValues] = useState<Record<string, unknown>>({});
-  const [dirty, setDirty] = useState<Record<string, unknown>>({});
+  const timers = useRef<Record<string, number>>({});
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [passwordPending, setPasswordPending] = useState(false);
+  const [updating, setUpdating] = useState(false);
 
   const settingsQuery = useQuery({
     queryKey: ["admin", "settings"],
@@ -52,18 +58,11 @@ export function SettingsPage() {
     queryKey: ["admin", "instance"],
     queryFn: () => apiGet<InstanceInfo>("/instance"),
   });
-  const auditQuery = useQuery({
-    queryKey: ["admin", "audit"],
-    queryFn: () =>
-      apiGet<{
-        events: {
-          id: number;
-          username: string;
-          action: string;
-          detail: string;
-          created_at: number;
-        }[];
-      }>("/audit?limit=30"),
+  const updateQuery = useQuery({
+    queryKey: ["admin", "update"],
+    queryFn: () => apiGet<UpdateInfo>("/update", { silent: true }),
+    refetchInterval: 3_600_000,
+    staleTime: 3_600_000,
   });
 
   const settings = useMemo(() => {
@@ -77,27 +76,112 @@ export function SettingsPage() {
 
   useEffect(() => {
     setValues(settings);
-    setDirty({});
   }, [settings]);
 
+  useEffect(
+    () => () => {
+      Object.values(timers.current).forEach((timer) => window.clearTimeout(timer));
+    },
+    [],
+  );
+
   const saveMutation = useMutation({
-    mutationFn: (payload: Record<string, unknown>) =>
-      apiPatch<{ ok: boolean; persisted: boolean; changed: string[] }>("/settings", {
-        values: payload,
-      }),
-    onSuccess: (data) => {
-      toast.success(data.persisted ? "已保存修改" : "已应用（仅本次进程生效）");
-      setDirty({});
-      queryClient.invalidateQueries({ queryKey: ["admin", "settings"] });
+    mutationFn: ({ key, value }: { key: string; value: unknown }) =>
+      apiPatch<{
+        ok: boolean;
+        persisted: boolean;
+        changed: string[];
+        settings?: Record<string, unknown>;
+      }>("/settings", { values: { [key]: value } }),
+    onSuccess: (data, variables) => {
+      const actual = data.settings?.[variables.key];
+      setValues((current) => {
+        if (actual === undefined || current[variables.key] !== variables.value) {
+          return current;
+        }
+        return { ...current, [variables.key]: actual };
+      });
       queryClient.invalidateQueries({ queryKey: ["admin", "concurrency"] });
       queryClient.invalidateQueries({ queryKey: ["admin", "models"] });
     },
     onError: (error: Error) => toast.error(error.message),
   });
+  const updateMutation = useMutation({
+    mutationFn: () =>
+      apiPost<{
+        ok: boolean;
+        started?: boolean;
+        latest?: string;
+        error?: string;
+      }>("/update/apply", {}),
+    onSuccess: (data) => {
+      if (!data.ok) {
+        toast.error(
+          data.error === "no_update"
+            ? "当前已是最新版本"
+            : data.error || "更新失败",
+        );
+        return;
+      }
+      setUpdating(true);
+      toast.success("更新已开始，服务将自动重启");
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+  const checkUpdateMutation = useMutation({
+    mutationFn: () => apiGet<UpdateInfo>("/update?force=1", { silent: true }),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["admin", "update"], data);
+      if (data.error) {
+        toast.error(`检查失败：${data.error}`);
+      } else if (data.available) {
+        toast.success(`发现新版本 ${data.latest}`);
+      } else {
+        toast.success("已是最新版本");
+      }
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+
+  useEffect(() => {
+    if (!updating) return;
+    const latest = (updateQuery.data?.latest ?? "").replace(/^v/, "");
+    const started = Date.now();
+    const timer = window.setInterval(async () => {
+      try {
+        const response = await fetch("/healthz", { cache: "no-store" });
+        if (response.ok) {
+          const data = await response.json();
+          if (!latest || String(data.version ?? "") === latest) {
+            window.location.reload();
+            return;
+          }
+        }
+      } catch {
+        // The service is restarting.
+      }
+      if (Date.now() - started > 60_000) {
+        window.clearInterval(timer);
+        setUpdating(false);
+        toast.error("更新未完成，请检查 data/update/update.log");
+      }
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [updating, updateQuery.data?.latest]);
 
   function setField(key: string, value: unknown) {
     setValues((current) => ({ ...current, [key]: value }));
-    setDirty((current) => ({ ...current, [key]: value }));
+    const currentTimer = timers.current[key];
+    if (currentTimer) window.clearTimeout(currentTimer);
+    if ((BOOLEAN_KEYS as readonly string[]).includes(key)) {
+      delete timers.current[key];
+      saveMutation.mutate({ key, value });
+      return;
+    }
+    timers.current[key] = window.setTimeout(() => {
+      delete timers.current[key];
+      saveMutation.mutate({ key, value });
+    }, 400);
   }
 
   async function changePassword(event: React.FormEvent) {
@@ -124,20 +208,22 @@ export function SettingsPage() {
 
   const instance = instanceQuery.data ?? settingsQuery.data?.instance;
   const accounts = concurrencyQuery.data?.accounts ?? {};
+  const totalConcurrency = Object.values(accounts).reduce(
+    (sum, item) => sum + (item.limit ?? 0),
+    0,
+  );
+  const updateInfo = updateQuery.data;
+  const hasUpdate = Boolean(updateInfo?.available);
 
   return (
     <>
       <PageHeader
         title="设置"
-        description="并发、上游、安全与运行信息，保存后写入数据库"
+        description="并发、上游、安全与运行信息，修改后自动保存"
         actions={
-          <Button
-            disabled={!Object.keys(dirty).length || saveMutation.isPending}
-            onClick={() => saveMutation.mutate(dirty)}
-          >
-            <Save className="h-4 w-4" />
-            {saveMutation.isPending ? "保存中…" : "保存修改"}
-          </Button>
+          <span className="text-xs text-muted">
+            {saveMutation.isPending ? "保存中…" : "修改后自动保存"}
+          </span>
         }
       />
 
@@ -185,7 +271,7 @@ export function SettingsPage() {
           <div className="grid gap-4 lg:grid-cols-2">
             <SectionCard
               title="并发与限流"
-              description="单账号并发上限，即同一账号可同时处理的请求数"
+              description="账号并发、冷却、失败换号与首字超时；换号次数最大为账号数 - 1"
             >
               <div className="grid grid-cols-2 gap-3">
                 <NumberField
@@ -197,6 +283,16 @@ export function SettingsPage() {
                   label="冷却时长（秒）"
                   value={values.account_cooldown}
                   onChange={(value) => setField("account_cooldown", value)}
+                />
+                <NumberField
+                  label="最多换号次数"
+                  value={values.account_failover_limit}
+                  onChange={(value) => setField("account_failover_limit", value)}
+                />
+                <NumberField
+                  label="首字超时（秒）"
+                  value={values.first_token_timeout}
+                  onChange={(value) => setField("first_token_timeout", value)}
                 />
               </div>
             </SectionCard>
@@ -246,13 +342,109 @@ export function SettingsPage() {
 
           <SectionCard
             title="请求限制"
-            description="限制单次 API 请求体大小"
+            description="限制请求体、工具输出和历史上下文大小"
           >
-            <NumberField
-              label="请求体上限（字节）"
-              value={values.max_request_bytes}
-              onChange={(value) => setField("max_request_bytes", value)}
-            />
+            <div className="grid grid-cols-2 gap-3">
+              <NumberField
+                label="请求体上限（字节）"
+                value={values.max_request_bytes}
+                onChange={(value) => setField("max_request_bytes", value)}
+              />
+              <NumberField
+                label="工具结果最大字符"
+                value={values.tool_result_max_chars}
+                onChange={(value) => setField("tool_result_max_chars", value)}
+              />
+              <NumberField
+                label="历史最大字符"
+                value={values.history_max_chars}
+                onChange={(value) => setField("history_max_chars", value)}
+              />
+              <NumberField
+                label="历史最大消息数（0 = 不限）"
+                value={values.history_max_messages}
+                onChange={(value) => setField("history_max_messages", value)}
+              />
+            </div>
+          </SectionCard>
+
+          <SectionCard
+            title="版本更新"
+            description="从 GitHub Release 检查并安装更新"
+          >
+            {updateQuery.isLoading ? (
+              <p className="text-13 text-muted">正在检查更新…</p>
+            ) : (
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-13 text-ink">
+                    当前版本{" "}
+                    <span className="font-mono">
+                      {updateInfo?.current || String(settings.version ?? "—")}
+                    </span>
+                    {hasUpdate ? (
+                      <span className="text-muted">
+                        {" → "}
+                        <span className="font-mono text-accent">
+                          {updateInfo?.latest}
+                        </span>
+                      </span>
+                    ) : null}
+                  </p>
+                  <p className="mt-1 text-xs text-muted">
+                    {updateInfo?.error
+                      ? `检查失败：${updateInfo.error}`
+                      : hasUpdate
+                        ? "发现新版本"
+                        : "已是最新版本"}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => checkUpdateMutation.mutate()}
+                    disabled={checkUpdateMutation.isPending || updating}
+                  >
+                    {checkUpdateMutation.isPending ? "检查中…" : "检查更新"}
+                  </Button>
+                  {updateInfo?.release_url ? (
+                    <Button variant="outline" size="sm" asChild>
+                      <a
+                        href={updateInfo.release_url}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Release
+                      </a>
+                    </Button>
+                  ) : null}
+                  {hasUpdate ? (
+                    <Button
+                      size="sm"
+                      onClick={() => updateMutation.mutate()}
+                      disabled={updateMutation.isPending || updating}
+                    >
+                      {updating
+                        ? "更新中…"
+                        : updateMutation.isPending
+                          ? "下载中…"
+                          : "一键更新"}
+                    </Button>
+                  ) : null}
+                </div>
+              </div>
+            )}
+            {hasUpdate && updateInfo?.notes ? (
+              <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded-tile bg-canvas p-3 text-xs text-muted">
+                {updateInfo.notes}
+              </pre>
+            ) : null}
+            {updating ? (
+              <p className="mt-3 text-xs text-accent">
+                更新已开始，服务重启后页面会自动刷新。
+              </p>
+            ) : null}
           </SectionCard>
 
           <SectionCard
@@ -262,7 +454,10 @@ export function SettingsPage() {
             <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
               <InfoTile label="版本" value={instance?.version || String(settings.version ?? "—")} />
               <InfoTile label="账号数" value={instance?.accounts ?? "—"} />
-              <InfoTile label="并发上限" value={concurrencyQuery.data?.default_limit ?? String(settings.default_concurrency ?? "—")} />
+              <InfoTile
+                label="总并发上限"
+                value={concurrencyQuery.isLoading ? "—" : totalConcurrency}
+              />
               <InfoTile label="PID" value={instance?.pid ?? "—"} />
               <InfoTile label="运行时长" value={instance?.uptime_seconds ? `${Math.floor(instance.uptime_seconds / 60)} 分钟` : "—"} />
               <InfoTile label="启动时间" value={formatTime(instance?.started_at)} />
@@ -285,27 +480,6 @@ export function SettingsPage() {
                     <span className="truncate font-mono text-xs">{id}</span>
                     <span className="text-center">{value.active}</span>
                     <span className="text-right">{value.limit}</span>
-                  </div>
-                ))
-              )}
-            </div>
-          </SectionCard>
-
-          <SectionCard title="审计日志" description="最近的管理员操作">
-            <div className="max-h-[280px] divide-y divide-border/70 overflow-y-auto text-13">
-              {(auditQuery.data?.events ?? []).length === 0 ? (
-                <p className="py-3 text-center text-xs text-muted">暂无审计记录</p>
-              ) : (
-                (auditQuery.data?.events ?? []).map((item) => (
-                  <div key={item.id} className="flex items-center justify-between gap-3 py-2">
-                    <div className="min-w-0">
-                      <p className="text-ink">{item.action}</p>
-                      <p className="truncate text-xs text-muted">{item.detail || "—"}</p>
-                    </div>
-                    <div className="shrink-0 text-right text-xs text-muted">
-                      <p>{item.username || "admin"}</p>
-                      <p>{formatTime(item.created_at)}</p>
-                    </div>
                   </div>
                 ))
               )}
@@ -343,6 +517,7 @@ const BOOLEAN_LABELS: Record<string, string> = {
   tool_duplicate_warning: "重复工具调用提醒",
   global_ide: "全局 IDE",
   native_tools: "原生工具",
+  prewarm_catalogs: "模型目录预热",
 };
 
 const BOOLEAN_HINTS: Record<string, string> = {
@@ -351,6 +526,7 @@ const BOOLEAN_HINTS: Record<string, string> = {
   tool_duplicate_warning: "在上下文中提醒已完成的工具调用",
   global_ide: "开启后模型列表和请求只使用 IDE",
   native_tools: "预留实验项，当前不生效",
+  prewarm_catalogs: "启动时预加载模型目录，首次打开更快（下次启动生效）",
 };
 
 function NumberField({

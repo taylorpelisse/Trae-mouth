@@ -107,7 +107,7 @@ class Config:
     refresh_window: int = 1800
     refresh_device_info: bool = False
     refresh_interval: int = 300
-    default_concurrency: int = 2
+    default_concurrency: int = 3
     model_catalog_ttl: int = 300
     api_key: str = ""
     reasoning_as_content: bool = True
@@ -118,11 +118,11 @@ class Config:
     tool_duplicate_warning: bool = True
     global_ide: bool = True
     native_tools: bool = False
-    first_token_timeout: int = 120
+    first_token_timeout: int = 60
     stream_heartbeat: int = 15
     conversation_affinity_ttl: int = 7 * 86400
     account_failover_limit: int = 2
-    account_cooldown: int = 300
+    account_cooldown: int = 120
     prewarm_catalogs: bool = True
     max_request_bytes: int = 128 * 1024 * 1024
 
@@ -174,7 +174,7 @@ class Config:
             refresh_window=_env_int("TRAE_MOUTH_REFRESH_WINDOW", 1800),
             refresh_device_info=_env_bool("TRAE_REFRESH_DEVICE_INFO", False),
             refresh_interval=_env_int("TRAE_MOUTH_REFRESH_INTERVAL", 300),
-            default_concurrency=_env_int("TRAE_MOUTH_DEFAULT_CONCURRENCY", 2),
+            default_concurrency=_env_int("TRAE_MOUTH_DEFAULT_CONCURRENCY", 3),
             model_catalog_ttl=_env_int("TRAE_MOUTH_MODEL_CATALOG_TTL", 300),
             api_key=_env("TRAE_MOUTH_API_KEY"),
             reasoning_as_content=_env_bool("TRAE_MOUTH_REASONING_AS_CONTENT", True),
@@ -189,7 +189,7 @@ class Config:
             ),
             global_ide=_env_bool("TRAE_MOUTH_GLOBAL_IDE", True),
             native_tools=_env_bool("TRAE_MOUTH_NATIVE_TOOLS", False),
-            first_token_timeout=_env_int("TRAE_MOUTH_FIRST_TOKEN_TIMEOUT", 120),
+            first_token_timeout=_env_int("TRAE_MOUTH_FIRST_TOKEN_TIMEOUT", 60),
             stream_heartbeat=_env_int("TRAE_MOUTH_STREAM_HEARTBEAT", 15),
             conversation_affinity_ttl=_env_int(
                 "TRAE_MOUTH_CONVERSATION_AFFINITY_TTL", 7 * 86400
@@ -197,7 +197,7 @@ class Config:
             account_failover_limit=_env_int(
                 "TRAE_MOUTH_ACCOUNT_FAILOVER_LIMIT", 2
             ),
-            account_cooldown=_env_int("TRAE_MOUTH_ACCOUNT_COOLDOWN", 300),
+            account_cooldown=_env_int("TRAE_MOUTH_ACCOUNT_COOLDOWN", 120),
             prewarm_catalogs=_env_bool("TRAE_MOUTH_PREWARM_CATALOGS", True),
             max_request_bytes=_env_int(
                 "TRAE_MOUTH_MAX_REQUEST_BYTES", 128 * 1024 * 1024

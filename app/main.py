@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import io
 import json
 import logging
@@ -38,6 +39,7 @@ from .accounts.store import (
     AccountStore,
 )
 from .admin import AdminStore, LoginLimiter
+from . import update as update_service
 from .admin_console import create_admin_console_router
 from .api.openai_routes import create_openai_router
 from .api_keys import ApiKeyStore
@@ -57,7 +59,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.1.1"
+VERSION = "0.2"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"
@@ -317,6 +319,8 @@ PERSISTED_SETTING_KEYS = (
     "native_tools",
     "default_concurrency",
     "account_cooldown",
+    "account_failover_limit",
+    "first_token_timeout",
     "model_catalog_ttl",
     "refresh_interval",
     "reasoning_as_content",
@@ -324,6 +328,9 @@ PERSISTED_SETTING_KEYS = (
     "tool_duplicate_warning",
     "prewarm_catalogs",
     "max_request_bytes",
+    "tool_result_max_chars",
+    "history_max_chars",
+    "history_max_messages",
     "model_gateway",
     "web_api_base",
 )
@@ -340,6 +347,19 @@ def _apply_persisted_settings(config: Config, db: Database) -> None:
             continue
         if hasattr(config, key):
             setattr(config, key, value)
+
+
+async def _scheduled_update_check() -> None:
+    while True:
+        now = dt.datetime.now()
+        next_run = (now + dt.timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        await asyncio.sleep(max(1.0, (next_run - now).total_seconds()))
+        try:
+            await asyncio.to_thread(update_service.check_update, VERSION, force=True)
+        except Exception:
+            logger.exception("scheduled update check failed")
 
 
 def create_app(
@@ -387,9 +407,15 @@ def create_app(
                 logger.exception("failed to bootstrap admin")
         import_handoff.clear_expired(config)
         refresher.start()
+        update_task = asyncio.create_task(_scheduled_update_check())
         try:
             yield
         finally:
+            update_task.cancel()
+            try:
+                await update_task
+            except asyncio.CancelledError:
+                pass
             refresher.stop()
             _release_instance_lock(lock_fd)
 
@@ -979,6 +1005,8 @@ def create_app(
             "refresh_interval": config.refresh_interval,
             "default_concurrency": config.default_concurrency,
             "account_cooldown": config.account_cooldown,
+            "account_failover_limit": config.account_failover_limit,
+            "first_token_timeout": config.first_token_timeout,
             "model_catalog_ttl": config.model_catalog_ttl,
             "reasoning_as_content": config.reasoning_as_content,
             "strict_tool_args": config.strict_tool_args,
@@ -987,6 +1015,9 @@ def create_app(
             "native_tools": config.native_tools,
             "prewarm_catalogs": config.prewarm_catalogs,
             "max_request_bytes": config.max_request_bytes,
+            "tool_result_max_chars": config.tool_result_max_chars,
+            "history_max_chars": config.history_max_chars,
+            "history_max_messages": config.history_max_messages,
             "allow_local_import": config.allow_local_import,
             "client_id": config.trae_client_id,
             "version": VERSION,
@@ -1006,6 +1037,19 @@ def create_app(
             "settings": payload,
             "raw": payload,
         }
+
+    @app.get("/admin/api/update")
+    def update_info(
+        force: int = 0, _: str = Depends(current_admin)
+    ) -> dict[str, Any]:
+        return update_service.check_update(VERSION, force=bool(force))
+
+    @app.post("/admin/api/update/apply")
+    def update_apply(_: str = Depends(current_admin)) -> dict[str, Any]:
+        try:
+            return update_service.apply_update(config, VERSION)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)[:300]) from exc
 
     @app.get("/admin/api/audit")
     def audit_events(
