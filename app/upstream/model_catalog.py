@@ -1,0 +1,457 @@
+from __future__ import annotations
+
+import json
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+import httpx
+
+from ..accounts.models import DeviceProfile
+from ..config import Config
+from .catalog import ide_headers, web_headers
+
+WEB_GROUPS = {
+    "solo_agent_remote": ("remote", "Remote"),
+    "solo_work_remote": ("work", "Work"),
+    "solo_design_remote": ("design", "Solo Web"),
+}
+IDE_GROUPS = {
+    "chat_v3": ("ide", "IDE Agent"),
+    "solo_agent": ("solo", "Solo"),
+    "builder_v3": ("solo", "Solo"),
+}
+
+
+def _int(value: Any) -> Optional[int]:
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _json(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+@dataclass
+class ModelVariant:
+    model_name: str
+    max_tokens: Optional[int] = None
+    prompt_max_tokens: Optional[int] = None
+    usage_cost: Optional[float] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "model_name": self.model_name,
+            "max_tokens": self.max_tokens,
+            "prompt_max_tokens": self.prompt_max_tokens,
+            "usage_cost": self.usage_cost,
+        }
+
+
+@dataclass
+class ModelEntry:
+    config_name: str
+    display_name: str
+    endpoint: str
+    functions: list[str] = field(default_factory=list)
+    provider_models: list[str] = field(default_factory=list)
+    context_window: Optional[int] = None
+    max_context: Optional[int] = None
+    max_output: Optional[int] = None
+    multimodal: bool = False
+    reasoning_supported: bool = False
+    reasoning_levels: list[str] = field(default_factory=list)
+    default_reasoning: str = ""
+    reasoning_source: str = ""
+    max_mode: bool = False
+    config_source: int = 1
+    usage_cost: Optional[float] = None
+    source: str = ""
+    variants: list[ModelVariant] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "config_name": self.config_name,
+            "display_name": self.display_name,
+            "endpoint": self.endpoint,
+            "functions": self.functions,
+            "provider_models": self.provider_models,
+            "context_window": self.context_window,
+            "max_context": self.max_context,
+            "max_output": self.max_output,
+            "multimodal": self.multimodal,
+            "reasoning": {
+                "supported": self.reasoning_supported,
+                "levels": self.reasoning_levels,
+                "default": self.default_reasoning,
+                "source": self.reasoning_source,
+            },
+            "max_mode": self.max_mode,
+            "config_source": self.config_source,
+            "usage_cost": self.usage_cost,
+            "source": self.source,
+            "variants": [variant.to_dict() for variant in self.variants],
+            "raw": self.raw,
+        }
+
+    def merge(self, other: "ModelEntry") -> None:
+        for function in other.functions:
+            if function not in self.functions:
+                self.functions.append(function)
+        for model in other.provider_models:
+            if model not in self.provider_models:
+                self.provider_models.append(model)
+        for variant in other.variants:
+            if not any(
+                existing.model_name == variant.model_name
+                for existing in self.variants
+            ):
+                self.variants.append(variant)
+        for attr in ("context_window", "max_context", "max_output"):
+            left = getattr(self, attr)
+            right = getattr(other, attr)
+            if right is not None and (left is None or right > left):
+                setattr(self, attr, right)
+        self.multimodal = self.multimodal or other.multimodal
+        self.max_mode = self.max_mode or other.max_mode
+        self.reasoning_supported = (
+            self.reasoning_supported or other.reasoning_supported
+        )
+        for level in other.reasoning_levels:
+            if level not in self.reasoning_levels:
+                self.reasoning_levels.append(level)
+        if not self.default_reasoning:
+            self.default_reasoning = other.default_reasoning
+        if not self.reasoning_source:
+            self.reasoning_source = other.reasoning_source
+        if self.usage_cost is None:
+            self.usage_cost = other.usage_cost
+        if not self.raw and other.raw:
+            self.raw = other.raw
+
+
+def _web_entry(
+    raw: dict[str, Any], function: str, endpoint: str
+) -> Optional[ModelEntry]:
+    config_name = str(
+        raw.get("config_name") or raw.get("name") or raw.get("model_name") or ""
+    ).strip()
+    if not config_name:
+        return None
+    context = _int((raw.get("context_window_tokens") or {}).get("dev"))
+    max_context = _int((raw.get("context_window_tokens") or {}).get("max"))
+    if not max_context:
+        max_context = context
+    reasoning = raw.get("reasoning_effort_config") or {}
+    levels = [
+        str(level)
+        for level in (reasoning.get("options") or [])
+        if str(level).strip()
+    ]
+    features = _json(raw.get("features"))
+    rate = (
+        (features.get("consumption_rate") or {}).get("data") or {}
+    ).get("rate")
+    return ModelEntry(
+        config_name=config_name,
+        display_name=str(raw.get("display_name") or config_name),
+        endpoint=endpoint,
+        functions=[function],
+        context_window=context,
+        max_context=max_context,
+        max_output=None,
+        multimodal=bool(raw.get("multimodal")),
+        reasoning_supported=bool(reasoning.get("support_thinking")),
+        reasoning_levels=levels,
+        default_reasoning=str(reasoning.get("default_level") or ""),
+        reasoning_source="web" if levels else "",
+        max_mode=bool(raw.get("max_mode"))
+        or bool(max_context and max_context >= 950_000),
+        config_source=int(raw.get("config_source") or 1),
+        usage_cost=_float(rate),
+        source="web",
+        raw=raw,
+    )
+
+
+def _ide_entry(raw: dict[str, Any], function: str, endpoint: str) -> Optional[ModelEntry]:
+    if str(raw.get("usage") or "") != "chat_completion":
+        return None
+    config_name = str(raw.get("config_name") or raw.get("name") or "").strip()
+    if not config_name:
+        return None
+    display = raw.get("display_config") or {}
+    window = raw.get("context_window_tokens") or {}
+    context = _int(window.get("dev"))
+    max_window = _int(window.get("max"))
+    variants: list[ModelVariant] = []
+    for item in raw.get("model_detail_list") or []:
+        if not isinstance(item, dict) or not item.get("model_name"):
+            continue
+        variants.append(
+            ModelVariant(
+                model_name=str(item["model_name"]),
+                max_tokens=_int(item.get("max_tokens")),
+                prompt_max_tokens=_int(item.get("prompt_max_tokens")),
+                usage_cost=_float(item.get("model_entitlement_usage_cost")),
+            )
+        )
+    max_output = max(
+        (variant.max_tokens for variant in variants if variant.max_tokens),
+        default=None,
+    )
+    prompt_max = max(
+        (variant.prompt_max_tokens for variant in variants if variant.prompt_max_tokens),
+        default=None,
+    )
+    max_context = max(
+        (value for value in (context, max_window, prompt_max) if value),
+        default=None,
+    )
+    capability = str(display.get("model_capability") or "")
+    reasoning = raw.get("reasoning_effort_config") or {}
+    reasoning_levels = [
+        str(level)
+        for level in (reasoning.get("options") or [])
+        if str(level).strip()
+    ]
+    reasoning_default = str(reasoning.get("default_level") or "")
+    reasoning_supported = bool(reasoning.get("support_thinking"))
+    if not reasoning and capability == "reasoning_model":
+        reasoning_supported = True
+    default_variant = next(
+        (variant for variant in variants if variant.model_name.endswith("__dev")),
+        variants[0] if variants else None,
+    )
+    return ModelEntry(
+        config_name=config_name,
+        display_name=str(display.get("display_name") or config_name),
+        endpoint=endpoint,
+        functions=[function],
+        provider_models=[variant.model_name for variant in variants],
+        context_window=context,
+        max_context=max_context,
+        max_output=max_output,
+        multimodal=bool(display.get("multimodal")),
+        reasoning_supported=reasoning_supported,
+        reasoning_levels=reasoning_levels,
+        default_reasoning=reasoning_default,
+        reasoning_source="ide" if reasoning_levels else "",
+        max_mode=bool(display.get("max_mode"))
+        or bool(max_window and max_window >= 950_000)
+        or bool(context and context >= 950_000),
+        config_source=int(raw.get("config_source") or 1),
+        usage_cost=default_variant.usage_cost if default_variant else None,
+        source="ide",
+        variants=variants,
+    )
+
+
+def _fetch_web(
+    client: httpx.Client,
+    config: Config,
+    token: str,
+    user_id: str,
+    function: str,
+) -> list[dict[str, Any]]:
+    url = (
+        f"{config.web_api_base}/models?functions={function}&show_custom_model=true"
+    )
+    response = client.get(url, headers=web_headers(config, token, user_id))
+    response.raise_for_status()
+    data = response.json()
+    groups = (data.get("data") or {}).get("list") or []
+    if isinstance(groups, dict):
+        groups = [groups]
+    for group in groups:
+        if str(group.get("function") or "") == function:
+            return [model for model in group.get("models") or [] if isinstance(model, dict)]
+    models: list[dict[str, Any]] = []
+    for group in groups:
+        models.extend(
+            [model for model in group.get("models") or [] if isinstance(model, dict)]
+        )
+    return models
+
+
+def _fetch_ide(
+    client: httpx.Client,
+    config: Config,
+    token: str,
+    user_id: str,
+    device: DeviceProfile,
+    function: str,
+) -> list[dict[str, Any]]:
+    body = {
+        "function": function,
+        "config_names": None,
+        "need_prompt": False,
+        "current_config_info": None,
+        "poly_prompt": True,
+        "mode_type": None,
+        "agent_type": None,
+    }
+    response = client.post(
+        f"{config.model_gateway}/api/ide/v1/get_detail_param",
+        headers=ide_headers(config, token, user_id, device, function),
+        json=body,
+    )
+    response.raise_for_status()
+    data = response.json()
+    rows = data.get("config_info_list") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        nested = data.get("data") if isinstance(data, dict) else None
+        rows = nested.get("config_info_list") if isinstance(nested, dict) else []
+    return [row for row in rows or [] if isinstance(row, dict)]
+
+
+def fetch_catalog(
+    config: Config,
+    token: str,
+    user_id: str,
+    device: DeviceProfile,
+    *,
+    transport: Optional[httpx.BaseTransport] = None,
+) -> dict[str, Any]:
+    errors: dict[str, str] = {}
+    group_meta: dict[str, dict[str, Any]] = {}
+    group_entries: dict[str, dict[str, ModelEntry]] = {}
+    web_reasoning: dict[str, ModelEntry] = {}
+
+    def prepare(endpoint: str, label: str, function: str) -> dict[str, ModelEntry]:
+        meta = group_meta.setdefault(
+            endpoint, {"label": label, "functions": []}
+        )
+        if function not in meta["functions"]:
+            meta["functions"].append(function)
+        return group_entries.setdefault(endpoint, {})
+
+    with httpx.Client(timeout=30, transport=transport) as client:
+        for function, (endpoint, label) in WEB_GROUPS.items():
+            entries = prepare(endpoint, label, function)
+            try:
+                rows = _fetch_web(client, config, token, user_id, function)
+            except Exception as exc:
+                errors[endpoint] = str(exc)[:300]
+                continue
+            for raw in rows:
+                entry = _web_entry(raw, function, endpoint)
+                if not entry:
+                    continue
+                if entry.config_name in entries:
+                    entries[entry.config_name].merge(entry)
+                else:
+                    entries[entry.config_name] = entry
+                if entry.reasoning_levels:
+                    web_reasoning.setdefault(entry.config_name, entry)
+
+        for function, (endpoint, label) in IDE_GROUPS.items():
+            entries = prepare(endpoint, label, function)
+            try:
+                rows = _fetch_ide(
+                    client, config, token, user_id, device, function
+                )
+            except Exception as exc:
+                errors[endpoint] = str(exc)[:300]
+                continue
+            for raw in rows:
+                entry = _ide_entry(raw, function, endpoint)
+                if not entry:
+                    continue
+                if entry.reasoning_supported and not entry.reasoning_levels:
+                    hint = web_reasoning.get(entry.config_name)
+                    if hint:
+                        entry.reasoning_levels = list(hint.reasoning_levels)
+                        entry.default_reasoning = hint.default_reasoning
+                        entry.reasoning_source = "web_catalog"
+                if entry.config_name in entries:
+                    entries[entry.config_name].merge(entry)
+                else:
+                    entries[entry.config_name] = entry
+
+    groups: dict[str, dict[str, Any]] = {}
+    for endpoint, meta in group_meta.items():
+        models = sorted(
+            group_entries.get(endpoint, {}).values(),
+            key=lambda item: item.display_name.lower(),
+        )
+        groups[endpoint] = {
+            "label": meta["label"],
+            "functions": meta["functions"],
+            "models": [model.to_dict() for model in models],
+            "model_count": len(models),
+        }
+    return {
+        "groups": groups,
+        "errors": errors,
+        "fetched_at": int(time.time()),
+        "model_count": sum(group["model_count"] for group in groups.values()),
+    }
+
+
+class CatalogCache:
+    def __init__(self, ttl: int = 300) -> None:
+        self.ttl = max(10, int(ttl))
+        self._lock = threading.Lock()
+        self._data: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._refreshing: set[str] = set()
+
+    def get_stale(self, account_id: str) -> Optional[dict[str, Any]]:
+
+        with self._lock:
+            cached = self._data.get(account_id)
+        return cached[1] if cached else None
+
+    def begin_refresh(self, account_id: str) -> bool:
+        with self._lock:
+            if account_id in self._refreshing:
+                return False
+            self._refreshing.add(account_id)
+            return True
+
+    def end_refresh(self, account_id: str) -> None:
+        with self._lock:
+            self._refreshing.discard(account_id)
+
+    def get(self, account_id: str, force: bool = False) -> Optional[dict[str, Any]]:
+        if force:
+            return None
+        now = time.time()
+        with self._lock:
+            cached = self._data.get(account_id)
+        if not cached:
+            return None
+        fetched_at, value = cached
+        if now - fetched_at > self.ttl:
+            # Keep the expired value available to get_stale() for
+            # stale-while-revalidate; a background refresh replaces it.
+            return None
+        return value
+
+    def put(self, account_id: str, value: dict[str, Any]) -> None:
+        with self._lock:
+            self._data[account_id] = (time.time(), value)
+
+    def invalidate(self, account_id: str) -> None:
+        with self._lock:
+            self._data.pop(account_id, None)

@@ -1,0 +1,146 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 150 20% 96%;
+  --foreground: 150 5% 10%;
+  --card: 0 0% 100%;
+  --primary: 142 72% 29%;
+  --primary-foreground: 150 60% 8%;
+  --secondary: 150 16% 94%;
+  --muted-foreground: 150 5% 46%;
+  --input: 150 12% 91%;
+  --ring: 142 72% 29%;
+  color-scheme: light;
+}
+
+* {
+  border-color: #e3ebe6;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  overflow-y: scroll;
+  scrollbar-gutter: stable;
+}
+
+body {
+  margin: 0;
+  background: #f3f8f5;
+  color: #171a18;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+html body[data-scroll-locked] {
+  position: static !important;
+  top: auto !important;
+  overflow: visible !important;
+  padding-right: 0 !important;
+  margin-right: 0 !important;
+}
+
+.select-text,
+input,
+textarea,
+code,
+pre,
+select {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+@supports (corner-shape: squircle) {
+  :not(.rounded-full) {
+    corner-shape: squircle;
+  }
+}
+
+@keyframes enter {
+  0% {
+    opacity: var(--enter-opacity, 1);
+    transform: translate3d(var(--enter-x, 0), var(--enter-y, 0), 0)
+      scale3d(var(--enter-scale, 1), var(--enter-scale, 1), 1);
+  }
+}
+
+@keyframes exit {
+  to {
+    opacity: var(--exit-opacity, 1);
+    transform: translate3d(var(--exit-x, 0), var(--exit-y, 0), 0)
+      scale3d(var(--exit-scale, 1), var(--exit-scale, 1), 1);
+  }
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+.table-sticky thead th {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: #ffffff;
+}
+
+.scrollbar-none {
+  scrollbar-width: none;
+}
+
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: #eef4f0;
+}
+
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.7),
+    transparent
+  );
+  animation: shimmer 1.6s infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}
