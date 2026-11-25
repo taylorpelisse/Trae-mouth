@@ -59,7 +59,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"
@@ -223,7 +223,12 @@ def _ensure_device(store: AccountStore, account_id: str, config: Config):
                 override.private_key_pem = private_key
             if not override.public_key or not override.private_key_pem:
                 override.public_key, override.private_key_pem = generate_keypair()
-            store.set_device(account_id, override)
+            baseline = device.to_dict() if device else None
+            key_changed = bool(override.private_key_pem) and (
+                override.private_key_pem != private_key
+            )
+            if baseline is None or override.to_dict() != baseline or key_changed:
+                store.set_device(account_id, override)
             return override
     if (
         device
@@ -241,7 +246,9 @@ def _ensure_device(store: AccountStore, account_id: str, config: Config):
             device.ide_version_code = config.ide_version_code
             store.set_device(account_id, device)
         return device
+    before: Optional[dict[str, Any]] = None
     if device:
+        before = device.to_dict()
         device = normalize_device(
             device.to_dict(),
             app_version=config.login_app_version,
@@ -258,7 +265,8 @@ def _ensure_device(store: AccountStore, account_id: str, config: Config):
         )
     if not device.public_key or not device.private_key_pem:
         device.public_key, device.private_key_pem = generate_keypair()
-    store.set_device(account_id, device)
+    if before is None or device.to_dict() != before:
+        store.set_device(account_id, device)
     return device
 
 
@@ -395,6 +403,15 @@ def create_app(
         use_device_info=config.refresh_device_info,
     )
 
+    http_client: Optional[httpx.AsyncClient] = None
+    if transport is None:
+        http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0),
+            limits=httpx.Limits(
+                max_connections=100, max_keepalive_connections=20
+            ),
+        )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         lock_fd = _acquire_instance_lock(config.data_dir / "trae_mouth.lock")
@@ -417,6 +434,8 @@ def create_app(
             except asyncio.CancelledError:
                 pass
             refresher.stop()
+            if http_client is not None:
+                await http_client.aclose()
             _release_instance_lock(lock_fd)
 
     app = FastAPI(
@@ -437,6 +456,7 @@ def create_app(
     app.state.events = events
     app.state.catalog_cache = catalog_cache
     app.state.transport = transport
+    app.state.http_client = http_client
     app.state.started_at = now_ts()
     account_router = AccountRouter(
         accounts,
@@ -1318,6 +1338,7 @@ exit /b %RC%
             ensure_device=_ensure_device,
             model_catalog_for=_model_catalog_for,
             account_router=account_router,
+            async_client=http_client,
         )
     )
     app.include_router(

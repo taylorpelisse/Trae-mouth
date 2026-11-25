@@ -551,3 +551,150 @@ def test_stream_raw_falls_back_to_v1() -> None:
     ]
     assert events[0]["data"]["response"] == "OK"
     assert events[-1]["event"] == "done"
+
+
+def test_convert_messages_keeps_only_last_assistant_reasoning() -> None:
+    converted = ide_chat.convert_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "first",
+                "reasoning_content": "old reasoning",
+            },
+            {"role": "user", "content": "go on"},
+            {
+                "role": "assistant",
+                "content": "second",
+                "reasoning_content": "new reasoning",
+            },
+        ]
+    )
+    assistants = [item for item in converted if item.get("role") == "assistant"]
+    assert assistants[0].get("reasoning_content") is None
+    assert assistants[1]["reasoning_content"] == "new reasoning"
+
+
+def test_convert_messages_drops_reasoning_on_tool_call_turns() -> None:
+    converted = ide_chat.convert_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "I will check.",
+                "reasoning_content": "need a tool",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+    )
+    assistant = next(item for item in converted if item.get("role") == "assistant")
+    assert assistant.get("reasoning_content") is None
+    assert assistant.get("reasoning") is None
+
+
+def test_completed_tool_reminder_is_attached_to_tail() -> None:
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Weather?"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "read",
+            "content": "ok",
+        },
+    ]
+    converted = ide_chat.convert_messages(
+        messages,
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "Read",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    )
+    system_text = converted[0]["content"][0]["text"]
+    assert "Completed client tool calls" not in system_text
+    assert converted[-1]["role"] == "user"
+    blocks = converted[-1]["content"]
+    assert "Client tool result" in blocks[0]["text"]
+    assert "Completed client tool calls" in blocks[-1]["text"]
+
+
+def test_estimate_tokens_handles_cjk_and_latin() -> None:
+    zh = "北京今天的天气很好适合出门散步" * 100
+    en = "The quick brown fox jumps over the lazy dog. " * 100
+    zh_tokens = ide_chat._estimate_tokens(zh)
+    en_tokens = ide_chat._estimate_tokens(en)
+    assert 0.45 < zh_tokens / len(zh) < 0.7
+    assert 0.15 < en_tokens / len(en) < 0.3
+
+
+def test_compact_history_respects_token_budget() -> None:
+    messages = [{"role": "user", "content": "旧消息" * 60} for _ in range(8)]
+    messages.append({"role": "user", "content": "最新问题"})
+    kept = ide_chat._compact_history(
+        messages, 0, 0, max_prompt_tokens=120, reserved_tokens=0
+    )
+    assert 1 <= len(kept) < len(messages)
+    assert kept[-1]["content"] == "最新问题"
+
+
+def test_tool_results_are_truncated_before_budgeting() -> None:
+    messages = [
+        {"role": "user", "content": "KEEP-ME " * 30},
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "X" * 200000,
+        },
+        {"role": "user", "content": "最近问题"},
+    ]
+    converted = ide_chat.convert_messages(
+        messages,
+        max_tool_result_chars=1000,
+        max_prompt_tokens=1200,
+    )
+    assert any("KEEP-ME" in str(item.get("content")) for item in converted)
+
+
+def test_compact_history_counts_images() -> None:
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    messages = [
+        {"role": "user", "content": [image, {"type": "text", "text": "图"}]}
+        for _ in range(6)
+    ]
+    kept = ide_chat._compact_history(
+        messages, 0, 0, max_prompt_tokens=2000, reserved_tokens=0
+    )
+    assert 1 <= len(kept) < len(messages)
+
+
+def test_convert_messages_accepts_legacy_function_role() -> None:
+    converted = ide_chat.convert_messages(
+        [{"role": "function", "name": "search", "content": "search result"}]
+    )
+    assert converted[0]["role"] == "user"
+    text = converted[0]["content"][0]["text"]
+    assert "Client tool result" in text
+    assert "name=search" in text
+    assert "search result" in text

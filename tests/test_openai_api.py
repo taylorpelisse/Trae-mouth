@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -8,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.accounts.models import build_device
-from app.api.openai_routes import OpenAIStreamTranslator
+from app.api.openai_routes import OpenAIStreamTranslator, _preflight_stream
 from app.main import create_app
 from app.upstream.ide_chat import UpstreamError
 from tests.conftest import make_jwt
@@ -606,3 +607,73 @@ def test_chat_failover_and_affinity(config) -> None:
         assert second_response.json()["trae"]["account_id"] == second.id
         assert len(seen_tokens) == 3
         assert seen_tokens[1] == seen_tokens[2]
+
+
+def test_preflight_treats_empty_completion_as_empty() -> None:
+    async def events():
+        yield {"event": "metadata", "data": {}}
+        yield {"event": "output", "data": {"phase": "thinking"}}
+        yield {"event": "done", "data": {}}
+
+    buffered, ok = asyncio.run(_preflight_stream(events(), 5))
+    assert ok is False
+    assert buffered
+
+
+def test_preflight_returns_on_first_payload() -> None:
+    async def events():
+        yield {"event": "metadata", "data": {}}
+        yield {"event": "output", "data": {"response": "hi"}}
+        yield {"event": "done", "data": {}}
+
+    buffered, ok = asyncio.run(_preflight_stream(events(), 5))
+    assert ok is True
+    assert buffered[-1]["data"]["response"] == "hi"
+
+
+def test_chat_empty_response_retries_without_cooldown(config) -> None:
+    config.api_key = "test-key"
+    empty = sse(("metadata", {}), ("done", {}))
+    good = sse(("output", {"response": "ok"}), ("done", {"finish_reason": "stop"}))
+    seen_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/llm_raw_chat"):
+            seen_tokens.append(request.headers.get("authorization", ""))
+            content = empty if len(seen_tokens) == 1 else good
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=content,
+            )
+        return httpx.Response(500, text="unexpected")
+
+    app = create_app(config, transport=httpx.MockTransport(handler))
+    client = TestClient(app)
+    with client:
+        first_id = prepare(app, client)
+        store = app.state.accounts
+        token = make_jwt({"data": {"id": "user-2"}, "exp": 4102444800})
+        second, _ = store.add_manual(
+            token=token,
+            user_id="user-2",
+            refresh_token="refresh-2",
+            token_expires_at=int(time.time()) + 86400,
+            device=build_device(),
+        )
+        app.state.catalog_cache.put(
+            second.id, dict(app.state.catalog_cache.get(first_id) or {})
+        )
+        response = client.post(
+            "/v1/chat/completions",
+            headers=auth(config),
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "empty then ok"}],
+            },
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["choices"][0]["message"]["content"] == "ok"
+        assert response.json()["trae"]["account_id"] == second.id
+        assert store.get(first_id).status == "active"
+        assert len(seen_tokens) == 2

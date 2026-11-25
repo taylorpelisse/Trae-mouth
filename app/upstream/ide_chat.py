@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import re
 import uuid
@@ -12,6 +13,9 @@ import httpx
 from ..accounts.models import DeviceProfile
 from ..config import Config
 from .catalog import ide_headers
+
+logger = logging.getLogger(__name__)
+IMAGE_TOKENS = 1600
 
 TOOL_START = "<trae_mouth_tool_call>"
 TOOL_END = "</trae_mouth_tool_call>"
@@ -680,15 +684,91 @@ def _tool_result_failed(message: Mapping[str, Any], text: str) -> bool:
     return lowered.startswith("error") or lowered.startswith("failed")
 
 
-def _history_message_size(message: Mapping[str, Any]) -> int:
-    size = len(_content_text(message.get("content")))
-    payload = message.get("tool_calls") or message.get("function_call")
-    if payload:
-        size += len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
-    reasoning = _message_reasoning(message)
-    if reasoning:
-        size += len(reasoning)
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate tuned to CJK-heavy prompts.
+
+    Measured against the IDE gateway: ~1.89 Chinese chars/token and
+    ~4.5 English chars/token.  The values below stay slightly conservative.
+    """
+
+    if not text:
+        return 0
+    cjk = 0
+    for char in text:
+        code = ord(char)
+        if (
+            0x3040 <= code <= 0x30FF
+            or 0x3400 <= code <= 0x4DBF
+            or 0x4E00 <= code <= 0x9FFF
+            or 0xAC00 <= code <= 0xD7AF
+            or 0xF900 <= code <= 0xFAFF
+            or 0xFF00 <= code <= 0xFFEF
+        ):
+            cjk += 1
+    other = len(text) - cjk
+    return int(cjk / 1.8 + other / 4.3) + 1
+
+
+def _image_blocks(message: Mapping[str, Any]) -> int:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        1
+        for part in content
+        if isinstance(part, Mapping)
+        and str(part.get("type") or "").lower() == "image_url"
+    )
+
+
+def _history_message_size(
+    message: Mapping[str, Any], count_reasoning: bool = False
+) -> int:
+    text = _content_text(message.get("content"))
+    size = len(text)
+    role = str(message.get("role") or "").lower()
+    if role in {"tool", "function"}:
+        size += 40
+    if count_reasoning:
+        size += len(_message_reasoning(message))
+    size += _image_blocks(message) * 4000
     return size
+
+
+def _history_message_tokens(
+    message: Mapping[str, Any], count_reasoning: bool = False
+) -> int:
+    tokens = _estimate_tokens(_content_text(message.get("content"))) + 4
+    role = str(message.get("role") or "").lower()
+    if role in {"tool", "function"}:
+        tokens += 32
+    if count_reasoning:
+        tokens += _estimate_tokens(_message_reasoning(message))
+    tokens += _image_blocks(message) * IMAGE_TOKENS
+    return tokens
+
+
+def _prepare_history(
+    messages: list[Mapping[str, Any]], max_tool_result_chars: int
+) -> list[Mapping[str, Any]]:
+    """Truncate tool results before the budget is measured."""
+
+    if max_tool_result_chars <= 0:
+        return list(messages)
+    prepared: list[Mapping[str, Any]] = []
+    for message in messages:
+        if isinstance(message, Mapping) and str(
+            message.get("role") or ""
+        ).lower() in {"tool", "function"}:
+            text = _content_text(message.get("content"))
+            truncated = _truncate_tool_result(text, max_tool_result_chars)
+            if truncated != text:
+                copy_message = dict(message)
+                copy_message["content"] = truncated
+                prepared.append(copy_message)
+                continue
+        prepared.append(message)
+    return prepared
 
 
 def _completed_tool_call_reminder(messages: list[Mapping[str, Any]]) -> str:
@@ -785,72 +865,127 @@ def _compact_history(
     messages: list[Mapping[str, Any]],
     max_chars: int,
     max_messages: int,
+    max_prompt_tokens: int = 0,
+    reserved_tokens: int = 0,
 ) -> list[Mapping[str, Any]]:
     """Keep system constraints plus a bounded recent history window.
 
-    Tool results are paired with their assistant call when the window starts
-    inside a tool exchange, so the model never sees a dangling result.
+    Token budgets follow the selected model's context window; the character
+    budget stays as an upper bound.  Tool results are paired with their
+    assistant call when the window starts inside a tool exchange, so the model
+    never sees a dangling result.
     """
 
-    if max_chars <= 0 and max_messages <= 0:
+    if max_chars <= 0 and max_messages <= 0 and max_prompt_tokens <= 0:
         return list(messages)
 
-    systems: list[Mapping[str, Any]] = []
-    non_system: list[Mapping[str, Any]] = []
+    entries: list[tuple[int, Mapping[str, Any]]] = []
+    for index, message in enumerate(messages):
+        if isinstance(message, Mapping):
+            entries.append((index, message))
+
+    systems: list[tuple[int, Mapping[str, Any]]] = []
+    non_system: list[tuple[int, Mapping[str, Any]]] = []
     seen_system: set[tuple[str, str]] = set()
-    for message in messages:
-        if not isinstance(message, Mapping):
-            continue
+    reasoning_index = -1
+    for index, message in entries:
         role = str(message.get("role") or "user")
         if role in {"system", "developer"}:
             key = (role, _content_text(message.get("content")))
             if key in seen_system:
                 continue
             seen_system.add(key)
-            systems.append(message)
+            systems.append((index, message))
         else:
-            non_system.append(message)
+            non_system.append((index, message))
+        if role == "assistant":
+            reasoning_index = index
+    if reasoning_index >= 0:
+        last_assistant = messages[reasoning_index]
+        calls = last_assistant.get("tool_calls")
+        if isinstance(calls, list) and calls:
+            # Reasoning is not sent together with tool calls.
+            reasoning_index = -1
 
     if max_messages > 0:
         candidates = non_system[-max_messages:]
     else:
         candidates = non_system
 
-    remaining = max_chars - sum(_history_message_size(message) for message in systems)
-    kept_reversed: list[Mapping[str, Any]] = []
-    used = 0
-    for message in reversed(candidates):
-        size = _history_message_size(message)
-        if kept_reversed and max_chars > 0 and used + size > remaining:
+    system_chars = sum(
+        _history_message_size(message, index == reasoning_index)
+        for index, message in systems
+    )
+    system_tokens = sum(
+        _history_message_tokens(message, index == reasoning_index)
+        for index, message in systems
+    )
+    remaining_chars = max_chars - system_chars if max_chars > 0 else -1
+    remaining_tokens = (
+        max_prompt_tokens - reserved_tokens - system_tokens
+        if max_prompt_tokens > 0
+        else -1
+    )
+    if max_prompt_tokens > 0 and remaining_tokens < 0:
+        logger.warning(
+            "system prompt alone exceeds token budget: %d + %d > %d",
+            system_tokens,
+            reserved_tokens,
+            max_prompt_tokens,
+        )
+
+    kept_reversed: list[tuple[int, Mapping[str, Any]]] = []
+    used_chars = 0
+    used_tokens = 0
+    for index, message in reversed(candidates):
+        count_reasoning = index == reasoning_index
+        size = _history_message_size(message, count_reasoning)
+        tokens = _history_message_tokens(message, count_reasoning)
+        if kept_reversed and (
+            (max_chars > 0 and used_chars + size > remaining_chars)
+            or (max_prompt_tokens > 0 and used_tokens + tokens > remaining_tokens)
+        ):
             break
-        kept_reversed.append(message)
-        used += size
+        kept_reversed.append((index, message))
+        used_chars += size
+        used_tokens += tokens
     kept = list(reversed(kept_reversed))
 
     # If the window starts with a tool result, include the assistant call
     # immediately before it; if that call is unavailable, drop the orphan.
-    while kept and str(kept[0].get("role") or "") == "tool":
-        try:
-            position = next(
-                index
-                for index, message in enumerate(non_system)
-                if message is kept[0]
-            )
-        except StopIteration:
-            position = -1
+    while kept and str(kept[0][1].get("role") or "") == "tool":
+        position = next(
+            (
+                offset
+                for offset, (index, _message) in enumerate(non_system)
+                if index == kept[0][0]
+            ),
+            -1,
+        )
         if position > 0:
-            previous = non_system[position - 1]
+            previous = non_system[position - 1][1]
             if (
                 str(previous.get("role") or "") == "assistant"
                 and isinstance(previous.get("tool_calls"), list)
             ):
-                kept.insert(0, previous)
+                kept.insert(0, non_system[position - 1])
                 break
         kept.pop(0)
 
     if not kept and non_system:
         kept = [non_system[-1]]
-    return [*systems, *kept]
+
+    if len(kept) < len(candidates):
+        logger.info(
+            "history trimmed: kept %d/%d messages, ~%d history tokens",
+            len(kept),
+            len(candidates),
+            used_tokens,
+        )
+
+    return [message for _index, message in systems] + [
+        message for _index, message in kept
+    ]
 
 
 def convert_messages(
@@ -861,16 +996,37 @@ def convert_messages(
     max_tool_result_chars: int = 0,
     max_history_chars: int = 0,
     max_history_messages: int = 0,
+    max_prompt_tokens: int = 0,
     include_completed_calls: bool = True,
 ) -> list[dict[str, Any]]:
+    messages = _prepare_history(messages, max_tool_result_chars)
+    tool_prompt = build_tool_prompt(tools, tool_choice, parallel_tool_calls)
+    # Reserve the stable tool block plus room for the tail reminder.
+    reserved_tokens = _estimate_tokens(tool_prompt) + (
+        2048 if tools and tool_choice != "none" else 256
+    )
     messages = _compact_history(
-        messages, max_history_chars, max_history_messages
+        messages,
+        max_history_chars,
+        max_history_messages,
+        max_prompt_tokens=max_prompt_tokens,
+        reserved_tokens=reserved_tokens,
     )
     system_parts: list[str] = []
     converted: list[dict[str, Any]] = []
     call_records: dict[str, dict[str, Any]] = {}
+    last_assistant_index = -1
+    for index, message in enumerate(messages):
+        if (
+            isinstance(message, Mapping)
+            and str(message.get("role") or "").lower() == "assistant"
+        ):
+            last_assistant_index = index
+    reminder = ""
+    if include_completed_calls and tools and tool_choice != "none":
+        reminder = _completed_tool_call_reminder(messages)
 
-    for message in messages:
+    for index, message in enumerate(messages):
         if not isinstance(message, Mapping):
             continue
         role = str(message.get("role") or "user").lower()
@@ -918,7 +1074,14 @@ def convert_messages(
             # Tool results below carry id/name/arguments instead.
             text = _content_text(content)
             blocks = _content_blocks(text)
-            reasoning = _message_reasoning(message)
+            has_calls = isinstance(raw_calls, list) and bool(raw_calls)
+            # Upstream rejects assistant reasoning combined with tool_calls;
+            # keep it only for the most recent plain assistant turn.
+            reasoning = (
+                _message_reasoning(message)
+                if index == last_assistant_index and not has_calls
+                else ""
+            )
             if blocks or reasoning:
                 item: dict[str, Any] = {"role": "assistant", "content": blocks}
                 if reasoning:
@@ -929,14 +1092,14 @@ def convert_messages(
                     item["reasoning_content"] = reasoning
                 converted.append(item)
             continue
-        if role == "tool":
+        if role in {"tool", "function"}:
             text = _truncate_tool_result(
                 _content_text(content), max_tool_result_chars
             )
             call_id = str(
                 message.get("tool_call_id")
                 or message.get("toolCallId")
-                or "unknown"
+                or ("legacy" if role == "function" else "unknown")
             )
             record = call_records.get(call_id, {})
             name = str(message.get("name") or record.get("name") or "tool")
@@ -971,12 +1134,6 @@ def convert_messages(
             if blocks:
                 converted.append({"role": "user", "content": blocks})
 
-    if include_completed_calls and tools and tool_choice != "none":
-        reminder = _completed_tool_call_reminder(messages)
-        if reminder:
-            system_parts.append(reminder)
-            system_parts.append("")
-    tool_prompt = build_tool_prompt(tools, tool_choice, parallel_tool_calls)
     if tool_prompt:
         system_parts.append(tool_prompt)
     if system_parts:
@@ -985,7 +1142,32 @@ def convert_messages(
             converted.insert(
                 0, {"role": "system", "content": [{"type": "text", "text": system}]}
             )
+    if reminder:
+        _attach_tail_note(converted, reminder)
     return converted
+
+
+def _attach_tail_note(
+    converted: list[dict[str, Any]], note: str
+) -> None:
+    """Attach a per-turn note to the tail so the system prefix stays stable."""
+
+    if not note or not converted:
+        return
+    last = converted[-1]
+    if str(last.get("role") or "") != "user":
+        converted.append({"role": "user", "content": [{"type": "text", "text": note}]})
+        return
+    content = last.get("content")
+    if isinstance(content, list):
+        content.append({"type": "text", "text": note})
+    elif isinstance(content, str) and content:
+        last["content"] = [
+            {"type": "text", "text": content},
+            {"type": "text", "text": note},
+        ]
+    else:
+        last["content"] = [{"type": "text", "text": note}]
 
 
 WEB_AGENT_TYPES = {
@@ -1130,6 +1312,7 @@ def build_body(
     max_tool_result_chars: int = 0,
     max_history_chars: int = 0,
     max_history_messages: int = 0,
+    max_prompt_tokens: int = 0,
     include_completed_calls: bool = True,
 ) -> dict[str, Any]:
     sid = session_id or str(uuid.uuid4())
@@ -1149,6 +1332,7 @@ def build_body(
             max_tool_result_chars=max_tool_result_chars,
             max_history_chars=max_history_chars,
             max_history_messages=max_history_messages,
+            max_prompt_tokens=max_prompt_tokens,
             include_completed_calls=include_completed_calls,
         ),
     }
@@ -1166,6 +1350,7 @@ async def stream_raw(
     body: Mapping[str, Any],
     *,
     transport: Optional[httpx.AsyncBaseTransport] = None,
+    client: Optional[httpx.AsyncClient] = None,
 ) -> AsyncIterator[dict[str, Any]]:
     function = str(resolved["raw_chat_function"])
     headers = ide_headers(
@@ -1183,7 +1368,9 @@ async def stream_raw(
     ]
     fallback_statuses = {404, 405, 410, 501}
     timeout = httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
-    client = httpx.AsyncClient(timeout=timeout, transport=transport)
+    owned_client = client is None
+    if client is None:
+        client = httpx.AsyncClient(timeout=timeout, transport=transport)
     response: Optional[httpx.Response] = None
     try:
         for index, url in enumerate(urls):
@@ -1241,7 +1428,8 @@ async def stream_raw(
     finally:
         if response is not None:
             await response.aclose()
-        await client.aclose()
+        if owned_client:
+            await client.aclose()
 
 
 class TextAccumulator:

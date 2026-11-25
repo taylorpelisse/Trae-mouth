@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, Callable, Mapping, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+import httpx
 from pydantic import BaseModel, ConfigDict
 
 from ..accounts.router import AccountRouter
@@ -24,6 +25,10 @@ from ..upstream.ide_chat import (
 )
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+class EmptyUpstreamError(UpstreamError):
+    """Upstream finished without producing any payload."""
 
 
 @dataclass(frozen=True)
@@ -687,6 +692,70 @@ class OpenAIStreamTranslator:
         }
 
 
+async def _preflight_stream(
+    stream: AsyncIterator[dict[str, Any]],
+    timeout: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Buffer until the first payload, treating a bare finish as empty."""
+
+    buffered: list[dict[str, Any]] = []
+    for _ in range(20):
+        try:
+            event = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise UpstreamError(
+                f"upstream first token timeout after {timeout}s",
+                status_code=504,
+            ) from exc
+        except StopAsyncIteration:
+            return buffered, False
+        buffered.append(event)
+        name = str(event.get("event") or "")
+        data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+        if name == "error":
+            message = str(data.get("message") or data.get("error") or "upstream error")
+            raise UpstreamError(message, status_code=502)
+        if name == "queue_continue":
+            raise UpstreamError(
+                "upstream requested a queued retry before first token",
+                status_code=503,
+            )
+        if name in {"done", "workflow_finish", "turn_completion"}:
+            # A terminal event before any payload means the model produced
+            # nothing.  Let the caller retry on another account.
+            return buffered, False
+        if name == "output":
+            if any(
+                data.get(key)
+                for key in (
+                    "response",
+                    "reasoning_content",
+                    "tool_calls",
+                    "multimodal_contents",
+                )
+            ):
+                return buffered, True
+            continue
+        if name in {"text_delta", "reasoning_delta", "thought"}:
+            fragment = (
+                data.get("delta")
+                or data.get("thought")
+                or data.get("content")
+                or data.get("text")
+                or data.get("response")
+            )
+            if isinstance(fragment, str) and fragment:
+                return buffered, True
+            continue
+        if name == "tool_call":
+            if data.get("tool_calls") or data.get("tool_call_info"):
+                return buffered, True
+            continue
+        if name == "content_security":
+            return buffered, True
+    return buffered, True
+
+
 def create_openai_router(
     *,
     config: Any,
@@ -697,6 +766,7 @@ def create_openai_router(
     ensure_device: Callable[[Any, str, Any], Any],
     model_catalog_for: Callable[[str, bool], dict[str, Any]],
     account_router: Optional[AccountRouter] = None,
+    async_client: Optional[httpx.AsyncClient] = None,
 ) -> APIRouter:
     router = APIRouter()
     if account_router is None:
@@ -795,41 +865,8 @@ def create_openai_router(
     async def _preflight(
         stream: AsyncIterator[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], bool]:
-        buffered: list[dict[str, Any]] = []
         timeout = max(10, int(getattr(config, "first_token_timeout", 120) or 120))
-        meaningful = {
-            "output",
-            "text_delta",
-            "reasoning_delta",
-            "thought",
-            "tool_call",
-            "done",
-            "content_security",
-        }
-        for _ in range(20):
-            try:
-                event = await asyncio.wait_for(stream.__anext__(), timeout=timeout)
-            except asyncio.TimeoutError as exc:
-                raise UpstreamError(
-                    f"upstream first token timeout after {timeout}s",
-                    status_code=504,
-                ) from exc
-            except StopAsyncIteration:
-                return buffered, False
-            buffered.append(event)
-            name = str(event.get("event") or "")
-            if name == "error":
-                data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
-                message = str(data.get("message") or data.get("error") or "upstream error")
-                raise UpstreamError(message, status_code=502)
-            if name == "queue_continue":
-                raise UpstreamError(
-                    "upstream requested a queued retry before first token",
-                    status_code=503,
-                )
-            if name in meaningful:
-                return buffered, True
-        return buffered, True
+        return await _preflight_stream(stream, timeout)
 
     async def _with_heartbeat(
         stream: AsyncIterator[dict[str, Any]],
@@ -1021,6 +1058,8 @@ def create_openai_router(
             raise HTTPException(status_code=503, detail="no active account")
         failovers = max(0, int(config.account_failover_limit or 0))
         max_attempts = min(len(active), failovers + 1)
+        allowed_attempts = max_attempts
+        empty_retries = 0
         exclude: set[str] = set()
         refreshed: set[str] = set()
         attempts = 0
@@ -1038,7 +1077,7 @@ def create_openai_router(
             exclude.discard(record.id)
             return True
 
-        while attempts < max_attempts:
+        while attempts < allowed_attempts:
             record = account_router.choose(
                 preferred=preferred if attempts == 0 and not exclude else "",
                 exclude=exclude,
@@ -1057,6 +1096,12 @@ def create_openai_router(
             entry = resolved.get("entry") or {}
             context_window = int(
                 entry.get("max_context") or entry.get("context_window") or 0
+            )
+            # Keep 20% of the window free for the answer and safety margin.
+            max_prompt_tokens = (
+                max(4096, int(context_window * 0.8) - 2048)
+                if context_window > 0
+                else 0
             )
             reasoning = entry.get("reasoning") or {}
             effective_effort = ""
@@ -1124,6 +1169,7 @@ def create_openai_router(
                         max_tool_result_chars=int(config.tool_result_max_chars or 0),
                         max_history_chars=int(config.history_max_chars or 0),
                         max_history_messages=int(config.history_max_messages or 0),
+                        max_prompt_tokens=max_prompt_tokens,
                         include_completed_calls=bool(config.tool_duplicate_warning),
                     )
                     stream = ide_chat.stream_raw(
@@ -1134,6 +1180,7 @@ def create_openai_router(
                         resolved,
                         body,
                         transport=transport,
+                        client=async_client,
                     )
                 translator = OpenAIStreamTranslator(
                     payload.model,
@@ -1174,11 +1221,27 @@ def create_openai_router(
 
                 if not payload.stream:
                     try:
+                        buffered, ok = await _preflight(stream)
+                        if not ok:
+                            raise EmptyUpstreamError(
+                                "upstream returned an empty response",
+                                status_code=502,
+                            )
+                        for event in buffered:
+                            for _chunk in translator.feed(event):
+                                pass
                         async for event in stream:
                             for _chunk in translator.feed(event):
                                 pass
                         translator.finalize()
                     except UpstreamError as exc:
+                        if isinstance(exc, EmptyUpstreamError):
+                            last_error = exc
+                            empty_retries += 1
+                            if empty_retries > 1:
+                                break
+                            allowed_attempts = max(allowed_attempts, attempts + 1)
+                            continue
                         last_error = exc
                         if _should_failover_status(exc.status_code):
                             if retry_after_auth_error(record, exc.status_code):
@@ -1248,11 +1311,14 @@ def create_openai_router(
                         status_code=exc.status_code, detail=str(exc)
                     ) from exc
                 if not ok:
-                    last_error = UpstreamError(
-                        "upstream stream ended before the first token",
+                    last_error = EmptyUpstreamError(
+                        "upstream returned an empty response",
                         status_code=502,
                     )
-                    account_router.mark_failure(record, 502, str(last_error))
+                    empty_retries += 1
+                    if empty_retries > 1:
+                        break
+                    allowed_attempts = max(allowed_attempts, attempts + 1)
                     continue
 
                 account_router.bind(conversation_key, record.id)
