@@ -59,7 +59,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.2.4"
+VERSION = "0.2.6"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"
@@ -416,6 +416,7 @@ def create_app(
     async def lifespan(app: FastAPI):
         lock_fd = _acquire_instance_lock(config.data_dir / "trae_mouth.lock")
         events.bind_loop(asyncio.get_running_loop())
+        update_service.reconcile(config, VERSION)
         if config.admin_password and not admin.has_admin():
             try:
                 admin.create_admin(config.admin_username, config.admin_password)
@@ -1070,6 +1071,15 @@ def create_app(
             return update_service.apply_update(config, VERSION)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)[:300]) from exc
+
+    @app.get("/admin/api/update/status")
+    def update_status(_: str = Depends(current_admin)) -> dict[str, Any]:
+        return {"ok": True, "version": VERSION, "job": update_service.read_job(config)}
+
+    @app.delete("/admin/api/update")
+    def update_ack(_: str = Depends(current_admin)) -> dict[str, Any]:
+        update_service.clear_job(config)
+        return {"ok": True}
 
     @app.get("/admin/api/audit")
     def audit_events(

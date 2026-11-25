@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { apiGet, apiPatch, apiPost } from "../lib/api";
+import { apiDelete, apiGet, apiPatch, apiPost } from "../lib/api";
 import type {
   AdminSettings,
   ConcurrencyInfo,
   InstanceInfo,
   UpdateInfo,
+  UpdateJob,
+  UpdateStatus,
 } from "../lib/types";
 import { formatTime } from "../lib/format";
 import { Button } from "../components/ui/button";
@@ -31,6 +33,30 @@ const BOOLEAN_KEYS = [
   "native_tools",
 ] as const;
 
+// 重启期间服务不可达属于正常现象，超过这个时长才判定失败
+const UPDATE_OFFLINE_LIMIT = 10 * 60_000;
+// 重启后前端文件已整体替换，用它记下结果，刷新后再提示
+const UPDATE_DONE_KEY = "trae-mouth:update-done";
+
+function isActiveJob(job: UpdateJob | null) {
+  return (
+    job?.status === "downloading" ||
+    job?.status === "installing" ||
+    job?.status === "restarting"
+  );
+}
+
+function updateButtonLabel(job: UpdateJob | null, pending: boolean) {
+  if (job?.status === "downloading") {
+    return job.percent === null ? "下载中…" : `下载 ${job.percent}%`;
+  }
+  if (job?.status === "installing") {
+    return job.percent === null ? "安装中…" : `安装 ${job.percent}%`;
+  }
+  if (job?.status === "restarting") return "重启中…";
+  return pending ? "准备中…" : "一键更新";
+}
+
 export function SettingsPage() {
   const queryClient = useQueryClient();
   const [values, setValues] = useState<Record<string, unknown>>({});
@@ -38,7 +64,8 @@ export function SettingsPage() {
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [passwordPending, setPasswordPending] = useState(false);
-  const [updating, setUpdating] = useState(false);
+  const [job, setJob] = useState<UpdateJob | null>(null);
+  const jobActive = isActiveJob(job);
 
   const settingsQuery = useQuery({
     queryKey: ["admin", "settings"],
@@ -113,6 +140,7 @@ export function SettingsPage() {
         started?: boolean;
         latest?: string;
         error?: string;
+        job?: UpdateJob;
       }>("/update/apply", {}),
     onSuccess: (data) => {
       if (!data.ok) {
@@ -123,8 +151,7 @@ export function SettingsPage() {
         );
         return;
       }
-      setUpdating(true);
-      toast.success("更新已开始，服务将自动重启");
+      if (data.job) setJob(data.job);
     },
     onError: (error: Error) => toast.error(error.message),
   });
@@ -143,31 +170,85 @@ export function SettingsPage() {
     onError: (error: Error) => toast.error(error.message),
   });
 
+  // 进度由服务端保存，进入页面时先同步一次：刷新或换设备都能接着看到
   useEffect(() => {
-    if (!updating) return;
-    const latest = (updateQuery.data?.latest ?? "").replace(/^v/, "");
-    const started = Date.now();
+    let cancelled = false;
+    const flash = window.localStorage.getItem(UPDATE_DONE_KEY);
+    apiGet<UpdateStatus>("/update/status", { silent: true })
+      .then((data) => {
+        if (cancelled) return;
+        if (data.job) setJob(data.job);
+        if (data.job?.status === "done") {
+          toast.success(`已更新到 ${data.job.target}`);
+          void apiDelete("/update", { silent: true });
+          setJob(null);
+        } else if (flash) {
+          toast.success(`已更新到 ${flash}`);
+        }
+        if (flash) window.localStorage.removeItem(UPDATE_DONE_KEY);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!jobActive) return;
+    let cancelled = false;
+    let inFlight = false;
+    let offlineSince = 0;
+
     const timer = window.setInterval(async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
-        const response = await fetch("/healthz", { cache: "no-store" });
-        if (response.ok) {
-          const data = await response.json();
-          if (!latest || String(data.version ?? "") === latest) {
-            window.location.reload();
-            return;
-          }
+        const data = await apiGet<UpdateStatus>("/update/status", { silent: true });
+        if (cancelled) return;
+        offlineSince = 0;
+        if (!data.job) {
+          setJob(null);
+          return;
+        }
+        if (data.job.status === "done") {
+          window.localStorage.setItem(UPDATE_DONE_KEY, data.job.target);
+          window.location.reload();
+          return;
+        }
+        setJob(data.job);
+        if (data.job.status === "failed") {
+          toast.error(`更新失败：${data.job.error || "未知原因"}`);
         }
       } catch {
-        // The service is restarting.
+        if (cancelled) return;
+        if (!offlineSince) offlineSince = Date.now();
+        if (Date.now() - offlineSince > UPDATE_OFFLINE_LIMIT) {
+          window.clearInterval(timer);
+          setJob((current) =>
+            current
+              ? {
+                  ...current,
+                  status: "failed",
+                  error: "服务长时间无响应，请检查 data/update/update.log",
+                }
+              : current,
+          );
+          toast.error("更新未完成，服务长时间无响应");
+        } else {
+          // 安装和重启期间服务不可达，按重启中展示
+          setJob((current) =>
+            current ? { ...current, status: "restarting" } : current,
+          );
+        }
+      } finally {
+        inFlight = false;
       }
-      if (Date.now() - started > 60_000) {
-        window.clearInterval(timer);
-        setUpdating(false);
-        toast.error("更新未完成，请检查 data/update/update.log");
-      }
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [updating, updateQuery.data?.latest]);
+    }, 1000);
+    return () => {
+      window.clearInterval(timer);
+      cancelled = true;
+    };
+  }, [jobActive]);
 
   function setField(key: string, value: unknown) {
     setValues((current) => ({ ...current, [key]: value }));
@@ -404,7 +485,7 @@ export function SettingsPage() {
                     variant="outline"
                     size="sm"
                     onClick={() => checkUpdateMutation.mutate()}
-                    disabled={checkUpdateMutation.isPending || updating}
+                    disabled={checkUpdateMutation.isPending || jobActive}
                   >
                     {checkUpdateMutation.isPending ? "检查中…" : "检查更新"}
                   </Button>
@@ -422,14 +503,11 @@ export function SettingsPage() {
                   {hasUpdate ? (
                     <Button
                       size="sm"
+                      className="min-w-[6.5rem]"
                       onClick={() => updateMutation.mutate()}
-                      disabled={updateMutation.isPending || updating}
+                      disabled={updateMutation.isPending || jobActive}
                     >
-                      {updating
-                        ? "更新中…"
-                        : updateMutation.isPending
-                          ? "下载中…"
-                          : "一键更新"}
+                      {updateButtonLabel(job, updateMutation.isPending)}
                     </Button>
                   ) : null}
                 </div>
@@ -440,9 +518,16 @@ export function SettingsPage() {
                 {updateInfo.notes}
               </pre>
             ) : null}
-            {updating ? (
+            {jobActive ? (
               <p className="mt-3 text-xs text-accent">
-                更新已开始，服务重启后页面会自动刷新。
+                {job?.status === "restarting"
+                  ? "更新已安装，服务重启后页面会自动刷新。"
+                  : "正在更新，请勿关闭页面。"}
+              </p>
+            ) : null}
+            {job?.status === "failed" ? (
+              <p className="mt-3 text-xs text-danger">
+                更新失败：{job.error || "未知原因"}
               </p>
             ) : null}
           </SectionCard>

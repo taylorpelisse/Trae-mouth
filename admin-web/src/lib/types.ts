@@ -210,6 +210,25 @@ export type UpdateInfo = {
   error?: string;
 };
 
+export type UpdateJob = {
+  id: string;
+  target: string;
+  from: string;
+  status: "downloading" | "installing" | "restarting" | "done" | "failed";
+  /** 0-100；无法计算时为 null */
+  percent: number | null;
+  detail?: string;
+  error?: string;
+  started_at: number;
+  updated_at: number;
+};
+
+export type UpdateStatus = {
+  ok: boolean;
+  version: string;
+  job: UpdateJob | null;
+};
+
 export type PlaygroundResult = {
   content: string;
   reasoning: string;
