@@ -14,6 +14,12 @@ export function formatNumber(value: unknown): string {
   return number.toLocaleString("zh-CN");
 }
 
+export function formatFullNumber(value: unknown): string {
+  return asNumber(value).toLocaleString("zh-CN", {
+    maximumFractionDigits: 2,
+  });
+}
+
 export function formatContext(value: unknown): string {
   const number = asNumber(value);
   if (!number) return "0";

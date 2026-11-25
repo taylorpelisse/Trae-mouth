@@ -908,6 +908,46 @@ function ManualPanel({ onDone }: { onDone: () => void }) {
   );
 }
 
+type CheckinResult = {
+  status: string;
+  detail?: string;
+};
+
+type CheckinResponse = {
+  ok: boolean;
+  already?: boolean;
+  claimed?: boolean;
+  risk?: boolean;
+  code?: number | null;
+  message?: string;
+};
+
+function classifyCheckin(data: CheckinResponse): CheckinResult {
+  if (data.already) {
+    return { status: "今日已签" };
+  }
+  if (data.ok && data.claimed) {
+    return { status: "签到成功" };
+  }
+  if (data.code === 9074 || data.risk) {
+    return {
+      status: "稍后重试",
+      detail: "服务器返回人多，请稍后再试",
+    };
+  }
+  return {
+    status: "签到异常",
+    detail: data.message || "签到失败",
+  };
+}
+
+function checkinStatusClass(status: string): string {
+  if (status === "签到成功") return "text-accent";
+  if (status === "稍后重试") return "text-amber-600";
+  if (status === "签到异常") return "text-red-600";
+  return "text-muted";
+}
+
 function CheckinDialog({
   open,
   onOpenChange,
@@ -917,7 +957,7 @@ function CheckinDialog({
   onOpenChange: (open: boolean) => void;
   accounts: Account[];
 }) {
-  const [state, setState] = useState<Record<string, string>>({});
+  const [state, setState] = useState<Record<string, CheckinResult>>({});
   const [running, setRunning] = useState(false);
   const [summary, setSummary] = useState("");
 
@@ -925,23 +965,34 @@ function CheckinDialog({
     setRunning(true);
     setState({});
     setSummary("");
-    const next: Record<string, string> = {};
+    const next: Record<string, CheckinResult> = {};
     for (const account of accounts) {
-      setState((current) => ({ ...current, [account.id]: "签到中…" }));
+      setState((current) => ({
+        ...current,
+        [account.id]: { status: "签到中…" },
+      }));
       try {
-        const data = await apiPost<{ ok: boolean; already?: boolean; message?: string }>(
+        const data = await apiPost<CheckinResponse>(
           "/activity/checkin/account",
           { account_id: account.id },
           { silent: true },
         );
-        next[account.id] = data.ok ? "已签到" : data.message || "签到失败";
+        next[account.id] = classifyCheckin(data);
       } catch (error) {
-        next[account.id] = error instanceof Error ? error.message : "签到失败";
+        next[account.id] = {
+          status: "签到异常",
+          detail: error instanceof Error ? error.message : "签到失败",
+        };
       }
-      setState((current) => ({ ...current, [account.id]: next[account.id] }));
+      setState((current) => ({
+        ...current,
+        [account.id]: next[account.id],
+      }));
     }
     setRunning(false);
-    const success = Object.values(next).filter((value) => value === "已签到").length;
+    const success = Object.values(next).filter(
+      (item) => item.status === "签到成功" || item.status === "今日已签",
+    ).length;
     setSummary(`签到成功 ${success} / ${accounts.length} 个账号`);
   }
 
@@ -954,13 +1005,40 @@ function CheckinDialog({
             按账号逐个查询状态并补签，失败原因会显示在对应账号下。
           </DialogDescription>
         </DialogHeader>
-        <div className="max-h-[160px] divide-y divide-border/70 overflow-y-auto text-13">
-          {accounts.map((account) => (
-            <div key={account.id} className="flex items-center justify-between gap-2 py-2">
-              <span className="truncate">{account.username || account.label || account.id}</span>
-              <span className="shrink-0 text-muted">{state[account.id] || "待签到"}</span>
-            </div>
-          ))}
+        <div className="max-h-[240px] overflow-y-auto overscroll-contain rounded-tile border border-border bg-canvas/40">
+          <div className="divide-y divide-border/70">
+            {accounts.map((account) => {
+              const result = state[account.id];
+              return (
+                <div
+                  key={account.id}
+                  className="flex items-start justify-between gap-3 px-3 py-2.5"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate text-13 text-ink">
+                      {account.username || account.label || account.id}
+                    </p>
+                    {result?.detail ? (
+                      <p
+                        className="mt-0.5 truncate text-xs text-muted"
+                        title={result.detail}
+                      >
+                        {result.detail}
+                      </p>
+                    ) : null}
+                  </div>
+                  <span
+                    className={cn(
+                      "shrink-0 text-13",
+                      checkinStatusClass(result?.status || "待签到"),
+                    )}
+                  >
+                    {result?.status || "待签到"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
         </div>
         <DialogFooter>
           {summary ? (

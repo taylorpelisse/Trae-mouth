@@ -40,7 +40,7 @@ import {
 
 type LogResponse = { items: AdminLog[]; total: number; limit: number; offset: number };
 type KeyList = { ok: boolean; keys: ApiKey[] };
-const PAGE_SIZE = 50;
+const PAGE_SIZES = [10, 20, 50, 100, 200] as const;
 
 function logTime(seconds: number): string {
   if (!seconds) return "—";
@@ -59,14 +59,16 @@ export function LogsPage() {
   const [model, setModel] = useState("");
   const [ip, setIp] = useState("");
   const [offset, setOffset] = useState(0);
+  const [pageSize, setPageSize] = useState(50);
   const [pendingClear, setPendingClear] = useState(false);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
   const [selectedLog, setSelectedLog] = useState<AdminLog | null>(null);
 
   const logsQuery = useQuery({
-    queryKey: ["admin", "logs", range, keyFilter, status, model, ip, offset],
+    queryKey: ["admin", "logs", range, keyFilter, status, model, ip, offset, pageSize],
     queryFn: () =>
       apiGet<LogResponse>(
-        `/logs?range=${range}&limit=${PAGE_SIZE}&offset=${offset}${
+        `/logs?range=${range}&limit=${pageSize}&offset=${offset}${
           keyFilter !== "all" ? `&key=${encodeURIComponent(keyFilter)}` : ""
         }${model ? `&model=${encodeURIComponent(model)}` : ""}${
           ip ? `&ip=${encodeURIComponent(ip)}` : ""
@@ -92,8 +94,17 @@ export function LogsPage() {
 
   const logs = logsQuery.data?.items ?? [];
   const total = logsQuery.data?.total ?? 0;
-  const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const page = Math.floor(offset / PAGE_SIZE) + 1;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const page = Math.floor(offset / pageSize) + 1;
+
+  async function refreshNow() {
+    setManualRefreshing(true);
+    try {
+      await logsQuery.refetch();
+    } finally {
+      setManualRefreshing(false);
+    }
+  }
 
   async function clearLogs() {
     if (!window.confirm("清空全部请求日志？该操作不可撤销。")) return;
@@ -114,15 +125,17 @@ export function LogsPage() {
     <>
       <PageHeader
         title="日志"
-        description="业务请求日志，30 秒自动刷新"
+        description="业务请求日志，0.5 秒自动刷新"
         actions={
           <>
             <Button
               variant="outline"
-              disabled={logsQuery.isFetching}
-              onClick={() => logsQuery.refetch()}
+              disabled={manualRefreshing}
+              onClick={refreshNow}
             >
-              <RefreshCw className={`h-4 w-4 ${logsQuery.isFetching ? "animate-spin" : ""}`} />
+              <RefreshCw
+                className={`h-4 w-4 ${manualRefreshing ? "animate-spin" : ""}`}
+              />
               刷新日志
             </Button>
             <Button variant="outline" disabled={pendingClear} onClick={clearLogs}>
@@ -182,12 +195,29 @@ export function LogsPage() {
           aria-label="按来源 IP 筛选"
         />
         <div className="ml-auto flex items-center gap-2 text-13 text-muted">
+          <Select
+            value={String(pageSize)}
+            onValueChange={(value) => {
+              setPageSize(Number(value));
+              setOffset(0);
+            }}
+          >
+            <SelectTrigger className="w-28" aria-label="每页条数">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {PAGE_SIZES.map((size) => (
+                <SelectItem key={size} value={String(size)}>
+                  {size} 条/页
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
           <span>共 {total} 条</span>
           <Button
             variant="outline"
-            size="sm"
             disabled={offset === 0}
-            onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
+            onClick={() => setOffset(Math.max(0, offset - pageSize))}
           >
             上一页
           </Button>
@@ -196,9 +226,8 @@ export function LogsPage() {
           </span>
           <Button
             variant="outline"
-            size="sm"
-            disabled={offset + PAGE_SIZE >= total}
-            onClick={() => setOffset(offset + PAGE_SIZE)}
+            disabled={offset + pageSize >= total}
+            onClick={() => setOffset(offset + pageSize)}
           >
             下一页
           </Button>

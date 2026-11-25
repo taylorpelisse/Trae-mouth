@@ -23,7 +23,7 @@ export const DialogContent = React.forwardRef<
       <DialogPrimitive.Content
         ref={ref}
         className={cn(
-          "pointer-events-auto relative grid max-h-[85vh] w-full max-w-lg gap-4 overflow-y-auto overflow-x-hidden rounded-panel border border-border bg-card p-6 shadow-dock focus:outline-none animate-in fade-in-0 zoom-in-95",
+          "pointer-events-auto relative grid max-h-[85vh] w-full max-w-lg gap-4 overflow-y-auto overflow-x-hidden overscroll-contain rounded-panel border border-border bg-card p-6 shadow-dock focus:outline-none animate-in fade-in-0 zoom-in-95",
           className,
         )}
         {...props}
@@ -94,7 +94,7 @@ export const SheetContent = React.forwardRef<
     <DialogPrimitive.Content
       ref={ref}
       className={cn(
-        "fixed inset-y-0 right-0 z-50 w-full max-w-md overflow-y-auto border-l border-border bg-card p-6 shadow-dock focus:outline-none animate-in slide-in-from-right",
+        "fixed inset-y-0 right-0 z-50 w-full max-w-md overflow-y-auto overscroll-contain border-l border-border bg-card p-6 shadow-dock focus:outline-none animate-in slide-in-from-right",
         className,
       )}
       {...props}

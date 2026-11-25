@@ -24,7 +24,7 @@ import {
 } from "recharts";
 import { apiGet } from "../lib/api";
 import type { Account, CreditSummary, DashboardMetrics, UpdateInfo } from "../lib/types";
-import { formatDuration, formatMillion, formatNumber } from "../lib/format";
+import { formatDuration, formatFullNumber, formatMillion, formatNumber } from "../lib/format";
 import { Button } from "../components/ui/button";
 import { SectionCard } from "../components/ui/card";
 import { EmptyState, PageHeader, StatCard } from "../components/ui/feedback";
@@ -192,9 +192,9 @@ export function DashboardPage() {
           label="剩余积分"
           loading={credits.isLoading}
           value={
-            credits.data?.available === null || credits.data?.available === undefined
-              ? "—"
-              : formatNumber(credits.data.available)
+              credits.data?.available === null || credits.data?.available === undefined
+                ? "—"
+                : formatFullNumber(credits.data.available)
           }
           hint={credits.data?.supported ? "Trae 账号余额合计" : "等待首次余额查询"}
           tone="success"

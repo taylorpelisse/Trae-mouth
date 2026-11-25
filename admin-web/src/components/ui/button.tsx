@@ -14,7 +14,7 @@ export const buttonVariants = cva(
         outline:
           "border border-border bg-card text-ink hover:border-ink/25 hover:bg-canvas",
         ghost: "text-muted hover:bg-canvas hover:text-ink",
-        danger: "bg-danger text-white hover:bg-danger/90",
+        danger: "bg-danger !text-white hover:bg-danger/90",
         link: "text-accent underline-offset-4 hover:underline",
       },
       size: {
