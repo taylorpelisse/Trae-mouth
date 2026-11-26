@@ -4,7 +4,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import httpx
 
@@ -49,6 +49,79 @@ def _json(value: Any) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError):
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+# OpenAI reasoning_effort 的取值，按强度从低到高
+OPENAI_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def openai_effort(level: Any, ranks: Mapping[str, int]) -> str:
+    """上游档位名换成 OpenAI 写法：light → low、extra_high → xhigh。
+
+    ranks 是请求侧的档位强度表，保证对外声明的写法发回来时
+    仍落在原来那个上游档位上。
+    """
+    text = str(level or "").strip().lower()
+    if not text:
+        return ""
+    if text in OPENAI_EFFORTS:
+        return text
+    rank = ranks.get(text)
+    if rank is None:
+        return text
+    # 同一档里有多个写法时取较强的那个：light 对应 low，而不是接近关闭的 minimal
+    return next(
+        (name for name in reversed(OPENAI_EFFORTS) if ranks.get(name) == rank), text
+    )
+
+
+def to_openai_model(
+    model: Mapping[str, Any],
+    model_id: str,
+    *,
+    tools: bool,
+    ranks: Mapping[str, int],
+    created: Any = None,
+) -> dict[str, Any]:
+    """目录里的一个模型 → /v1/models 的条目。
+
+    外层是 OpenAI 标准的四个字段；上下文、模态、推理档位这些
+    能力字段 OpenAI 没有定义，按 OpenRouter 的通行写法给出。
+    """
+    reasoning = model.get("reasoning") or {}
+    efforts: list[str] = []
+    for level in reasoning.get("levels") or []:
+        effort = openai_effort(level, ranks)
+        if effort and effort not in efforts:
+            efforts.append(effort)
+    context = _int(model.get("max_context")) or _int(model.get("context_window"))
+    parameters = ["reasoning_effort"] if efforts else []
+    if tools:
+        parameters += ["tools", "tool_choice", "parallel_tool_calls"]
+    entry: dict[str, Any] = {
+        "id": model_id,
+        "object": "model",
+        "created": int(created or time.time()),
+        "owned_by": "trae",
+        "name": str(model.get("display_name") or model_id),
+        "context_length": context,
+        "architecture": {
+            "input_modalities": ["text", "image"] if model.get("multimodal") else ["text"],
+            "output_modalities": ["text"],
+        },
+        "top_provider": {
+            "context_length": context,
+            "max_completion_tokens": _int(model.get("max_output")),
+        },
+        "supported_parameters": sorted(parameters),
+    }
+    if efforts:
+        entry["reasoning"] = {
+            "supported": True,
+            "supported_efforts": efforts,
+            "default_effort": openai_effort(reasoning.get("default"), ranks) or None,
+        }
+    return entry
 
 
 @dataclass

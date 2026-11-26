@@ -17,7 +17,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict
 
 from ..accounts.router import AccountRouter
-from ..upstream import ide_chat, web_chat
+from ..upstream import ide_chat, model_catalog, web_chat
 from ..upstream.ide_chat import (
     TextAccumulator,
     ToolBlockFilter,
@@ -955,7 +955,9 @@ def create_openai_router(
             records = account_router.active()
             if not records:
                 raise HTTPException(status_code=503, detail="no active account")
-        models: dict[str, dict[str, Any]] = {}
+        # 同一个模型 id 可能出现在多个通道（IDE 与 Web 各一份），保留首次出现的条目
+        models: dict[str, tuple[Mapping[str, Any], bool]] = {}
+        fetched_at: Any = None
         group_order = (
             ["ide"]
             if getattr(config, "global_ide", True)
@@ -966,51 +968,33 @@ def create_openai_router(
                 catalog = model_catalog_for(record.id, False)
             except Exception:
                 continue
+            fetched_at = fetched_at or catalog.get("fetched_at")
             groups = catalog.get("groups") or {}
             for group_key in group_order:
                 group = groups.get(group_key)
                 if not isinstance(group, Mapping):
                     continue
+                web = group_key in web_chat.WEB_CHANNELS
                 for model in group.get("models") or []:
                     config_name = str(model.get("config_name") or "")
                     if not config_name:
                         continue
-                    web = group_key in web_chat.WEB_CHANNELS
                     model_ids = (
                         [f"{group_key}/{config_name}"] if web else [config_name]
                     )
                     for model_id in model_ids:
-                        existing = models.get(model_id)
-                        if existing:
-                            existing["trae"]["endpoints"] = sorted(
-                                set(existing["trae"]["endpoints"]) | {group_key}
-                            )
-                            existing["trae"]["account_ids"] = sorted(
-                                set(existing["trae"]["account_ids"]) | {record.id}
-                            )
-                            continue
-                        models[model_id] = {
-                            "id": model_id,
-                            "object": "model",
-                            "created": int(catalog.get("fetched_at") or time.time()),
-                            "owned_by": "trae",
-                            "trae": {
-                                "display_name": model.get("display_name"),
-                                "channel": group_key,
-                                "endpoints": [group_key],
-                                "tools_supported": not web,
-                                "functions": model.get("functions") or [],
-                                "context_window": model.get("context_window"),
-                                "max_context": model.get("max_context"),
-                                "max_output": model.get("max_output"),
-                                "multimodal": bool(model.get("multimodal")),
-                                "max_mode": bool(model.get("max_mode")),
-                                "reasoning": model.get("reasoning") or {},
-                                "provider_models": model.get("provider_models") or [],
-                                "account_ids": [record.id],
-                            },
-                        }
-        return {"object": "list", "data": sorted(models.values(), key=lambda item: item["id"])}
+                        models.setdefault(model_id, (model, not web))
+        data = [
+            model_catalog.to_openai_model(
+                model,
+                model_id,
+                tools=tools,
+                ranks=_REASONING_RANKS,
+                created=fetched_at,
+            )
+            for model_id, (model, tools) in models.items()
+        ]
+        return {"object": "list", "data": sorted(data, key=lambda item: item["id"])}
 
     def _record_usage(
         *,

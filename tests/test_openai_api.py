@@ -11,11 +11,14 @@ from fastapi.testclient import TestClient
 from app.accounts.models import build_device
 from app.api.openai_routes import (
     OpenAIStreamTranslator,
+    _REASONING_RANKS,
+    _nearest_reasoning_level,
     _preflight_stream,
     _upstream_error_status,
 )
 from app.main import create_app
 from app.upstream.ide_chat import UpstreamError
+from app.upstream.model_catalog import openai_effort
 from tests.conftest import make_jwt
 
 
@@ -99,6 +102,57 @@ def prepare(app, client, *, max_output: int = 64000) -> str:
 def auth(config):
     config.api_key = "test-key"
     return {"Authorization": "Bearer test-key"}
+
+
+def test_models_endpoint_returns_openai_compatible_fields(config) -> None:
+    app, client = make_client(config, "", [])
+    with client:
+        prepare(app, client)
+        response = client.get("/v1/models", headers=auth(config))
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["object"] == "list"
+        entry = next(item for item in body["data"] if item["id"] == "test-model")
+        assert set(entry) == {
+            "id",
+            "object",
+            "created",
+            "owned_by",
+            "name",
+            "context_length",
+            "architecture",
+            "top_provider",
+            "supported_parameters",
+            "reasoning",
+        }
+        assert entry["object"] == "model"
+        assert entry["owned_by"] == "trae"
+        assert entry["name"] == "Test Model"
+        # 网关按最大上下文工作，对外声明的也是它
+        assert entry["context_length"] == 1000000
+        assert entry["architecture"]["input_modalities"] == ["text"]
+        assert entry["top_provider"]["max_completion_tokens"] == 64000
+        assert entry["supported_parameters"] == [
+            "parallel_tool_calls",
+            "reasoning_effort",
+            "tool_choice",
+            "tools",
+        ]
+        assert entry["reasoning"] == {
+            "supported": True,
+            "supported_efforts": ["low", "high"],
+            "default_effort": "high",
+        }
+        # 账号池编号、内部路由字段和旧的 trae 扩展块都不出网关
+        for private in ("account_ids", "provider_models", '"trae":', "functions"):
+            assert private not in response.text
+
+
+@pytest.mark.parametrize("level", ["light", "medium", "high", "extra_high", "xhigh"])
+def test_advertised_efforts_resolve_back_to_upstream_levels(level) -> None:
+    # 对外声明的写法发回网关后，必须仍落在原来的上游档位上
+    assert _nearest_reasoning_level(openai_effort(level, _REASONING_RANKS), [level], "") == level
 
 
 def test_chat_nonstream_and_stream(config) -> None:

@@ -5,7 +5,11 @@ import json
 import httpx
 
 from app.accounts.models import build_device
+from app.api.openai_routes import _REASONING_RANKS
+from app.upstream import model_catalog
 from app.upstream.model_catalog import CatalogCache, fetch_catalog
+
+RANKS = _REASONING_RANKS
 
 
 def handler(request: httpx.Request) -> httpx.Response:
@@ -187,5 +191,94 @@ def test_catalog_cache_keeps_stale_value() -> None:
     assert cache.get_stale("a") == {"ok": True}
     assert cache.begin_refresh("a") is True
     assert cache.begin_refresh("a") is False
-    cache.end_refresh("a")
+    assert cache.end_refresh("a") is None
     assert cache.begin_refresh("a") is True
+
+
+def test_openai_effort_uses_openai_vocabulary() -> None:
+    assert model_catalog.openai_effort("light", RANKS) == "low"
+    assert model_catalog.openai_effort("LIGHT", RANKS) == "low"
+    assert model_catalog.openai_effort("high", RANKS) == "high"
+    assert model_catalog.openai_effort("extra_high", RANKS) == "xhigh"
+    # 表里没有的写法原样保留，不臆造
+    assert model_catalog.openai_effort("turbo", RANKS) == "turbo"
+    assert model_catalog.openai_effort("", RANKS) == ""
+
+
+def test_to_openai_model_follows_common_gateway_fields() -> None:
+    model = {
+        "config_name": "glm",
+        "display_name": "GLM",
+        "provider_models": ["glm__dev", "glm__max"],
+        "context_window": 116000,
+        "max_context": 1000000,
+        "max_output": 64000,
+        "multimodal": True,
+        "usage_cost": 0.5,
+        "reasoning": {
+            "supported": True,
+            "levels": ["light", "high", "extra_high"],
+            "default": "high",
+            "source": "ide",
+        },
+    }
+
+    entry = model_catalog.to_openai_model(
+        model, "glm", tools=True, ranks=RANKS, created=1700000000
+    )
+
+    assert entry == {
+        "id": "glm",
+        "object": "model",
+        "created": 1700000000,
+        "owned_by": "trae",
+        "name": "GLM",
+        "context_length": 1000000,
+        "architecture": {
+            "input_modalities": ["text", "image"],
+            "output_modalities": ["text"],
+        },
+        "top_provider": {"context_length": 1000000, "max_completion_tokens": 64000},
+        "supported_parameters": [
+            "parallel_tool_calls",
+            "reasoning_effort",
+            "tool_choice",
+            "tools",
+        ],
+        "reasoning": {
+            "supported": True,
+            "supported_efforts": ["low", "high", "xhigh"],
+            "default_effort": "high",
+        },
+    }
+    text = json.dumps(entry)
+    for private in (
+        "account_ids",
+        "provider_models",
+        "usage_cost",
+        "config_name",
+        "config_source",
+        "functions",
+        "source",
+    ):
+        assert private not in text
+
+
+def test_to_openai_model_without_reasoning_or_tools() -> None:
+    model = {
+        "config_name": "plain",
+        "context_window": 32000,
+        "reasoning": {"supported": False, "levels": [], "default": ""},
+    }
+
+    entry = model_catalog.to_openai_model(
+        model, "work/plain", tools=False, ranks=RANKS
+    )
+
+    assert "reasoning" not in entry
+    assert entry["supported_parameters"] == []
+    assert entry["context_length"] == 32000
+    assert entry["top_provider"]["max_completion_tokens"] is None
+    assert entry["architecture"]["input_modalities"] == ["text"]
+    # 没有展示名时用模型 id
+    assert entry["name"] == "work/plain"
