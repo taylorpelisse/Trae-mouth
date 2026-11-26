@@ -60,7 +60,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.2.8"
+VERSION = "0.2.9"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"

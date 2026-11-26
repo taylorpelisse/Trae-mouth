@@ -16,7 +16,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../lib/api";
-import type { Account, CreditSummary } from "../lib/types";
+import type { Account, CheckinAutoStatus, CreditSummary } from "../lib/types";
 import {
   copyText,
   daysUntil,
@@ -39,6 +39,7 @@ import { EmptyState, PageHeader } from "../components/ui/feedback";
 import { IconAction } from "../components/ui/icon-action";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
+import { Switch } from "../components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -962,6 +963,22 @@ function CheckinDialog({
   const [state, setState] = useState<Record<string, CheckinResult>>({});
   const [running, setRunning] = useState(false);
   const [summary, setSummary] = useState("");
+  const [autoOpen, setAutoOpen] = useState(false);
+  const [autoLabel, setAutoLabel] = useState("");
+
+  // 弹窗打开时读一次自动签到的当前设置，用来显示按钮文字
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    apiGet<{ settings?: AutoCheckinSettings }>("/settings", { silent: true })
+      .then((data) => {
+        if (!cancelled) setAutoLabel(describeAutoCheckin(data.settings));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
 
   async function start() {
     setRunning(true);
@@ -1046,6 +1063,9 @@ function CheckinDialog({
           {summary ? (
             <p className="mr-auto self-center text-13 text-muted">{summary}</p>
           ) : null}
+          <Button variant="outline" onClick={() => setAutoOpen(true)}>
+            {autoLabel || "自动签到"}
+          </Button>
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             关闭
           </Button>
@@ -1053,7 +1073,181 @@ function CheckinDialog({
             {running ? "签到中…" : "开始签到"}
           </Button>
         </DialogFooter>
+        {/* 嵌套弹窗要渲染在父弹窗内容里面，否则父弹窗会把焦点移动当成点到外面而关闭 */}
+        <AutoCheckinDialog
+          open={autoOpen}
+          onOpenChange={setAutoOpen}
+          onSaved={setAutoLabel}
+        />
       </DialogContent>
     </Dialog>
+  );
+}
+
+type AutoCheckinSettings = {
+  checkin_auto?: boolean;
+  checkin_auto_time?: string;
+};
+
+const CHECKIN_TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+function describeAutoCheckin(settings: AutoCheckinSettings | undefined) {
+  if (!settings?.checkin_auto) return "自动签到：未开启";
+  return `自动签到：每天 ${settings.checkin_auto_time || "09:00"}`;
+}
+
+function describeClock(epoch: number): string {
+  const date = new Date(epoch * 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getMonth() + 1}/${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function AutoCheckinDialog({
+  open,
+  onOpenChange,
+  onSaved,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onSaved: (label: string) => void;
+}) {
+  const [enabled, setEnabled] = useState(false);
+  const [time, setTime] = useState("09:00");
+  // 上次保存成功的时刻，输入到一半失焦时恢复成它
+  const [savedTime, setSavedTime] = useState("09:00");
+  const [status, setStatus] = useState<CheckinAutoStatus | null>(null);
+  const [message, setMessage] = useState("");
+
+  const refreshStatus = () =>
+    apiGet<CheckinAutoStatus>("/checkin/auto", { silent: true })
+      .then(setStatus)
+      .catch(() => undefined);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setMessage("");
+    apiGet<{ settings?: AutoCheckinSettings }>("/settings", { silent: true })
+      .then((data) => {
+        if (cancelled) return;
+        setEnabled(Boolean(data.settings?.checkin_auto));
+        const value = data.settings?.checkin_auto_time || "09:00";
+        setTime(value);
+        setSavedTime(value);
+      })
+      .catch(() => undefined);
+    void refreshStatus();
+    const poll = window.setInterval(() => void refreshStatus(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(poll);
+    };
+  }, [open]);
+
+  function reportFailure(error: unknown) {
+    setMessage(error instanceof Error ? error.message : "保存失败");
+  }
+
+  async function toggle(next: boolean) {
+    const previous = enabled;
+    setEnabled(next);
+    onSaved(describeAutoCheckin({ checkin_auto: next, checkin_auto_time: time }));
+    try {
+      await apiPatch("/settings", { values: { checkin_auto: next } });
+      setMessage("");
+      await refreshStatus();
+    } catch (error) {
+      setEnabled(previous);
+      onSaved(describeAutoCheckin({ checkin_auto: previous, checkin_auto_time: time }));
+      reportFailure(error);
+    }
+  }
+
+  // 时刻输入过程中会有不完整的值，填完整了才保存
+  async function changeTime(value: string) {
+    setTime(value);
+    if (!CHECKIN_TIME_PATTERN.test(value)) return;
+    try {
+      await apiPatch("/settings", { values: { checkin_auto_time: value } });
+      setSavedTime(value);
+      setMessage("");
+      await refreshStatus();
+      onSaved(describeAutoCheckin({ checkin_auto: enabled, checkin_auto_time: value }));
+    } catch (error) {
+      reportFailure(error);
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>自动签到</DialogTitle>
+          <DialogDescription>
+            每天在设定时刻给全部启用账号签到，当天没签成的每 30 分钟补签一次，至 23:30。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex items-center justify-between gap-3 rounded-tile border border-border bg-canvas px-3 py-2.5">
+          <div>
+            <p className="text-13 text-ink">每日自动签到</p>
+            <p className="mt-0.5 text-xs text-muted">
+              被上游限流的账号会冷却 15 分钟并自动更换设备号
+            </p>
+          </div>
+          <Switch checked={enabled} onCheckedChange={toggle} />
+        </div>
+        <div className="flex flex-col gap-1.5">
+          <Label htmlFor="checkin-auto-time">每日签到时刻</Label>
+          <Input
+            id="checkin-auto-time"
+            type="time"
+            value={time}
+            onChange={(event) => void changeTime(event.target.value)}
+            onBlur={() => {
+              if (!CHECKIN_TIME_PATTERN.test(time)) setTime(savedTime);
+            }}
+          />
+        </div>
+        {message ? <p className="text-xs text-danger">{message}</p> : null}
+        <AutoCheckinStatusLines status={status} />
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            关闭
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AutoCheckinStatusLines({ status }: { status: CheckinAutoStatus | null }) {
+  if (!status) {
+    return <p className="text-xs text-muted">正在读取自动签到状态…</p>;
+  }
+  const last = status.last;
+  return (
+    <div className="space-y-1 text-xs text-muted">
+      {!status.time_valid ? (
+        <p className="text-danger">签到时刻格式无效，自动签到没有运行，请改成 HH:MM。</p>
+      ) : null}
+      {status.enabled && status.next_run ? (
+        <p>
+          {status.running ? "正在签到…" : `下次签到：${describeClock(status.next_run)}`}
+        </p>
+      ) : (
+        <p>自动签到未开启，可在上方打开。</p>
+      )}
+      {last ? (
+        <p>
+          上次（{describeClock(last.at)}）：已签 {last.signed} · 限流 {last.rate_limited} · 失败{" "}
+          {last.failed} · 共 {last.total}
+        </p>
+      ) : (
+        <p>还没有运行过。</p>
+      )}
+      {status.enabled && status.pending.length > 0 && !status.running ? (
+        <p>还有 {status.pending.length} 个账号没签成，冷却期满后自动补签。</p>
+      ) : null}
+    </div>
   );
 }
