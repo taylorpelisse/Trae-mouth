@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import re
 import threading
 import time
@@ -24,6 +25,8 @@ from ..upstream.ide_chat import (
     UpstreamError,
     map_usage,
 )
+
+logger = logging.getLogger(__name__)
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
@@ -266,6 +269,7 @@ class OpenAIStreamTranslator:
         self.queue_continue = False
         self.content_filtered = False
         self.tools_expected = tools_expected
+        self.dropped_truncated_call = False
         self.reasoning_as_content = reasoning_as_content
         self.tool_schemas = dict(tool_schemas or {})
         self.strict_tool_args = strict_tool_args
@@ -543,38 +547,28 @@ class OpenAIStreamTranslator:
         visible, new_calls = self.filter.feed(self.response.text, final=True)
         incomplete = self.filter.incomplete
         if incomplete:
-            if ide_chat.TOOL_START.startswith(incomplete):
-                # A bare partial marker is only worth failing on when the model
-                # clearly started writing the call marker.  A trailing "<" is
-                # ordinary text, not an interrupted tool call.
-                if len(incomplete) >= 8:
-                    raise UpstreamError(
-                        "tool call output was interrupted before its payload",
-                        account_fault=False,
-                    )
-            else:
-                salvaged = ide_chat._parse_tool_block(incomplete)
-                if salvaged:
-                    new_calls.extend(salvaged)
-                else:
-                    raise UpstreamError(
-                        "tool call output was truncated before completion",
-                        account_fault=False,
-                    )
-        if self.filter.native_truncated:
-            raise UpstreamError(
-                "native tool call output was truncated before completion",
-                account_fault=False,
-            )
-        if self.filter.native_incomplete:
-            native = self.filter.native_incomplete
+            salvaged = ide_chat._parse_tool_block(incomplete)
+            if salvaged:
+                new_calls.extend(salvaged)
+            elif "{" in incomplete or len(incomplete) >= 8:
+                # 长上下文里思考会占掉大部分输出额度，工具调用写到一半就断。
+                # 丢弃这条残缺调用、保留已输出的正文，比整轮 502 有用：
+                # 客户端至少能看到模型说了什么，下一轮还能重试。
+                self.dropped_truncated_call = True
+                logger.warning(
+                    "dropped truncated tool call payload (%d chars)",
+                    len(incomplete),
+                )
+        native = self.filter.native_incomplete
+        if native:
             salvaged = ide_chat._parse_json_tool_calls(native)
             if salvaged:
                 new_calls.extend(salvaged)
-            elif "{" in native:
-                raise UpstreamError(
-                    "native tool call output was truncated before completion",
-                    account_fault=False,
+            elif self.filter.native_truncated or "{" in native:
+                self.dropped_truncated_call = True
+                logger.warning(
+                    "dropped truncated native tool call payload (%d chars)",
+                    len(native),
                 )
             else:
                 # A call marker quoted in prose is text, not an interrupted call.
@@ -651,6 +645,18 @@ class OpenAIStreamTranslator:
             self.visible = self.reasoning.text
             self.emitted_content = True
             chunks.append(self._chunk({"content": self.reasoning.text}))
+        if (
+            self.dropped_truncated_call
+            and not self.calls
+            and not self.emitted_content
+            and not self.content_filtered
+        ):
+            # 残缺调用被丢弃后什么都没剩下，说明这一轮确实没产出可用内容，
+            # 报明确的截断错误，方便定位是输出额度不够。
+            raise UpstreamError(
+                "tool call output was truncated before completion",
+                account_fault=False,
+            )
         if (
             self.tools_expected
             and not self.calls
