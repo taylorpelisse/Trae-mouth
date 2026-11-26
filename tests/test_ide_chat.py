@@ -221,8 +221,13 @@ def test_normalize_tool_arguments_repairs_defaults_and_types() -> None:
     )
     assert normalized == {"x": 7, "mode": "fast", "count": 1}
     assert ide_chat.normalize_tool_arguments("tool", {"x": True}, schema)["x"] == 1
+    # 缺必填字段不再中断整轮请求，只补默认值后原样下发。
+    assert ide_chat.normalize_tool_arguments("tool", {}, schema) == {"count": 1}
+    # 类型修不了时保留原值，同样不报错。
+    assert ide_chat.normalize_tool_arguments("tool", {"x": "abc"}, schema)["x"] == "abc"
+    # 参数完全不是 JSON 时才按错误处理。
     with pytest.raises(ValueError):
-        ide_chat.normalize_tool_arguments("tool", {}, schema)
+        ide_chat.normalize_tool_arguments("tool", "{not json", schema)
 
 
 def test_convert_messages_truncates_large_tool_result() -> None:

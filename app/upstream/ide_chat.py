@@ -562,7 +562,12 @@ def normalize_tool_arguments(
     *,
     strict: bool = True,
 ) -> dict[str, Any]:
-    """Repair common tool-argument mistakes before returning them to a client."""
+    """Repair common tool-argument mistakes before returning them to a client.
+
+    模型侧的参数失误（缺必填字段、类型写错）只修复和记录，不升级成请求失败：
+    一条写坏的工具调用交给下游客户端报错、让模型下一轮自己补全，比整轮 400
+    中断对话有用得多。只有连 JSON 都解析不出来的参数仍然按错误处理。
+    """
 
     if arguments is None:
         args: dict[str, Any] = {}
@@ -603,12 +608,18 @@ def normalize_tool_arguments(
         prop = properties.get(key)
         if not isinstance(prop, Mapping) or value is None:
             continue
-        args[key] = _coerce_tool_value(value, prop, name)
+        try:
+            args[key] = _coerce_tool_value(value, prop, name)
+        except ValueError:
+            # 类型对不上就按原值下发，由客户端和模型下一轮自行纠正。
+            logger.warning(
+                "tool %r field %r keeps raw value: %r", name, key, value
+            )
 
     missing = [key for key in required if key not in args or args[key] is None]
-    if missing and strict:
-        raise ValueError(
-            f"tool {name!r} is missing required field(s): {', '.join(missing)}"
+    if missing:
+        logger.warning(
+            "tool %r missing required field(s): %s", name, ", ".join(missing)
         )
     return args
 

@@ -579,7 +579,8 @@ def test_translator_repairs_tool_arguments() -> None:
     assert json.loads(call["function"]["arguments"]) == {"x": 7}
 
 
-def test_invalid_tool_arguments_are_request_errors() -> None:
+def test_missing_tool_arguments_are_passed_through() -> None:
+    """缺必填字段不再中断整轮请求，调用原样下发由客户端报错。"""
     schema = {
         "type": "object",
         "properties": {"file_path": {"type": "string"}},
@@ -596,10 +597,39 @@ def test_invalid_tool_arguments_are_request_errors() -> None:
         '{"name":"Read","arguments":{"path":"a.py"}}'
         "</trae_mouth_tool_call>"
     )
+    translator.feed({"event": "output", "data": {"response": block}})
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    translator.finalize()
+    calls = translator.message()["tool_calls"]
+    assert len(calls) == 1
+    assert calls[0]["function"]["name"] == "Read"
+    assert json.loads(calls[0]["function"]["arguments"]) == {"path": "a.py"}
+
+
+def test_unparseable_tool_arguments_are_request_errors() -> None:
+    """参数连 JSON 都解析不出来时仍按请求错误处理。"""
+    schema = {
+        "type": "object",
+        "properties": {"file_path": {"type": "string"}},
+        "required": ["file_path"],
+    }
+    translator = OpenAIStreamTranslator(
+        "test-model",
+        tools_expected=True,
+        tool_schemas={"Read": schema},
+        strict_tool_args=True,
+    )
     with pytest.raises(UpstreamError) as info:
-        translator.feed({"event": "output", "data": {"response": block}})
+        translator.feed(
+            {
+                "event": "output",
+                "data": {
+                    "tool_calls": [{"name": "Read", "arguments": "{not json"}],
+                },
+            }
+        )
     assert info.value.status_code == 400
-    assert "file_path" in str(info.value)
+    assert "not valid JSON" in str(info.value)
 
 
 def test_translator_requires_tool_call_when_requested() -> None:
@@ -1004,13 +1034,7 @@ def test_model_output_errors_are_not_account_faults() -> None:
             {
                 "event": "output",
                 "data": {
-                    "response": (
-                        "<||DSML||tool_calls>"
-                        '<||DSML||invoke name="Read">'
-                        '<||DSML||parameter name="path" string="true">'
-                        "a.py</||DSML||parameter>"
-                        "</||DSML||invoke></||DSML||tool_calls>"
-                    )
+                    "tool_calls": [{"name": "Read", "arguments": "{not json"}],
                 },
             }
         )
@@ -1113,15 +1137,7 @@ def test_chat_stream_invalid_arguments_keep_account_active(config) -> None:
     content = sse(
         (
             "output",
-            {
-                "response": (
-                    "<||DSML||tool_calls>"
-                    '<||DSML||invoke name="Read">'
-                    '<||DSML||parameter name="path" string="true">'
-                    "a.py</||DSML||parameter>"
-                    "</||DSML||invoke></||DSML||tool_calls>"
-                )
-            },
+            {"tool_calls": [{"name": "Read", "arguments": "{not json"}]},
         ),
         ("done", {"finish_reason": "stop"}),
     )
@@ -1153,7 +1169,7 @@ def test_chat_stream_invalid_arguments_keep_account_active(config) -> None:
             assert response.status_code == 200
             body = "".join(response.iter_text())
         assert '"error"' in body
-        assert "file_path" in body
+        assert "not valid JSON" in body
         assert "data: [DONE]" in body
         assert app.state.accounts.get(first_id).status == "active"
 
