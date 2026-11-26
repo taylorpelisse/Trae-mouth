@@ -920,6 +920,8 @@ type CheckinResponse = {
   risk?: boolean;
   code?: number | null;
   message?: string;
+  rate_limited?: boolean;
+  retry_in?: number;
 };
 
 function classifyCheckin(data: CheckinResponse): CheckinResult {
@@ -929,10 +931,10 @@ function classifyCheckin(data: CheckinResponse): CheckinResult {
   if (data.ok && data.claimed) {
     return { status: "签到成功" };
   }
-  if (data.code === 9074 || data.risk) {
+  if (data.rate_limited || data.code === 9074) {
     return {
-      status: "稍后重试",
-      detail: "服务器返回人多，请稍后再试",
+      status: "限流中",
+      detail: `签到设备号被上游限流，${data.retry_in ?? 15} 分钟后可再试，届时会自动更换设备号`,
     };
   }
   return {
@@ -943,7 +945,7 @@ function classifyCheckin(data: CheckinResponse): CheckinResult {
 
 function checkinStatusClass(status: string): string {
   if (status === "签到成功") return "text-accent";
-  if (status === "稍后重试") return "text-amber-600";
+  if (status === "限流中" || status === "稍后重试") return "text-amber-600";
   if (status === "签到异常") return "text-red-600";
   return "text-muted";
 }

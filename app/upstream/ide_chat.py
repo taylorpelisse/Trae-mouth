@@ -1642,7 +1642,9 @@ def _partial_native_suffix(text: str) -> int:
     if index < 0:
         return 0
     fragment = text[index:]
-    compact = re.sub(r"\s+", "", fragment).lower()
+    # 全角竖线换成半角、单双竖线视为同一种写法，再与标记比对
+    compact = re.sub(r"\s+", "", fragment).replace("｜", "|").lower()
+    compact = re.sub(r"\|+", "||", compact)
     if not compact:
         return 0
     for marker in _NATIVE_MARKERS:

@@ -40,6 +40,7 @@ from .accounts.store import (
 )
 from .admin import AdminStore, LoginLimiter
 from . import update as update_service
+from . import checkin as checkin_service
 from .admin_console import create_admin_console_router
 from .api.openai_routes import create_openai_router
 from .api_keys import ApiKeyStore
@@ -59,7 +60,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.2.7"
+VERSION = "0.2.8"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"
@@ -341,6 +342,8 @@ PERSISTED_SETTING_KEYS = (
     "history_max_messages",
     "model_gateway",
     "web_api_base",
+    "checkin_auto",
+    "checkin_auto_time",
 )
 
 
@@ -370,6 +373,16 @@ async def _scheduled_update_check() -> None:
             logger.exception("scheduled update check failed")
 
 
+async def _auto_checkin_loop(service: Any) -> None:
+    auto = checkin_service.AutoCheckin(service)
+    while True:
+        await asyncio.sleep(20)
+        try:
+            await auto.tick()
+        except Exception:
+            logger.exception("auto check-in failed")
+
+
 def create_app(
     config: Optional[Config] = None,
     *,
@@ -390,6 +403,9 @@ def create_app(
     admin = AdminStore(db)
     limiter = LoginLimiter()
     events = EventBus()
+    checkin = checkin_service.CheckinService(
+        config=config, db=db, accounts=accounts, transport=transport
+    )
     catalog_cache = model_catalog.CatalogCache(ttl=config.model_catalog_ttl)
     refresher = TokenRefresher(
         accounts,
@@ -426,12 +442,18 @@ def create_app(
         import_handoff.clear_expired(config)
         refresher.start()
         update_task = asyncio.create_task(_scheduled_update_check())
+        auto_checkin_task = asyncio.create_task(_auto_checkin_loop(checkin))
         try:
             yield
         finally:
             update_task.cancel()
             try:
                 await update_task
+            except asyncio.CancelledError:
+                pass
+            auto_checkin_task.cancel()
+            try:
+                await auto_checkin_task
             except asyncio.CancelledError:
                 pass
             refresher.stop()
@@ -458,6 +480,7 @@ def create_app(
     app.state.catalog_cache = catalog_cache
     app.state.transport = transport
     app.state.http_client = http_client
+    app.state.checkin = checkin
     app.state.started_at = now_ts()
     account_router = AccountRouter(
         accounts,
@@ -1041,6 +1064,8 @@ def create_app(
             "history_max_messages": config.history_max_messages,
             "allow_local_import": config.allow_local_import,
             "client_id": config.trae_client_id,
+            "checkin_auto": config.checkin_auto,
+            "checkin_auto_time": config.checkin_auto_time,
             "version": VERSION,
         }
         return {
@@ -1365,6 +1390,7 @@ exit /b %RC%
             version=VERSION,
             started_at=app.state.started_at,
             transport=transport,
+            checkin=checkin,
         )
     )
 

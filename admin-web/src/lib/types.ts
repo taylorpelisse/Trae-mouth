@@ -229,6 +229,37 @@ export type UpdateStatus = {
   job: UpdateJob | null;
 };
 
+export type CheckinPassItem = {
+  account_id: string;
+  label: string;
+  status: "signed" | "rate_limited" | "failed" | "cooldown";
+  detail: string;
+};
+
+export type CheckinPassSummary = {
+  at: number;
+  trigger: string;
+  day: string;
+  total: number;
+  signed: number;
+  rate_limited: number;
+  failed: number;
+  pending: number;
+  items: CheckinPassItem[];
+};
+
+export type CheckinAutoStatus = {
+  ok: boolean;
+  enabled: boolean;
+  time: string;
+  time_valid: boolean;
+  next_run: number | null;
+  running: boolean;
+  last: CheckinPassSummary | null;
+  pending: string[];
+  cooldown: Record<string, number>;
+};
+
 export type PlaygroundResult = {
   content: string;
   reasoning: string;

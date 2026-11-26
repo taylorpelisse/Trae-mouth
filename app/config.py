@@ -125,6 +125,9 @@ class Config:
     account_cooldown: int = 120
     prewarm_catalogs: bool = True
     max_request_bytes: int = 128 * 1024 * 1024
+    # 每日自动签到：开关与当天的发起时刻（HH:MM）
+    checkin_auto: bool = False
+    checkin_auto_time: str = "09:00"
 
     trae_auth_host: str = "https://api.trae.cn"
     trae_client_id: str = "ono9krqynydwx5"

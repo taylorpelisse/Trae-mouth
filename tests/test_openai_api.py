@@ -910,6 +910,39 @@ def test_translator_does_not_leak_held_marker_at_finalize() -> None:
     assert calls == [("Bash", {"command": "echo hi"})]
 
 
+def test_translator_does_not_leak_fullwidth_marker_split_across_chunks() -> None:
+    # 线上真实分块：全角竖线的前半截单独一块，" calls>" 在下一块
+    content, calls = translate(
+        [
+            "我来看一下 <｜｜DSML｜｜",
+            " calls>\n"
+            '<｜｜DSML｜｜ invoke name="Bash">'
+            '<｜｜DSML｜｜ parameter name="command" string="true">'
+            "dir C:\\Users\\24183\\.zcode\\v2"
+            "</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>",
+        ],
+        tools_expected=True,
+    )
+    assert content == "我来看一下 "
+    assert calls == [("Bash", {"command": r"dir C:\Users\24183\.zcode\v2"})]
+
+
+def test_translator_does_not_leak_fullwidth_marker_without_prose() -> None:
+    # 没有任何正文时，客户端不应收到记号文本
+    content, calls = translate(
+        [
+            "<｜｜DSML｜｜",
+            " calls>\n"
+            '<｜｜DSML｜｜ invoke name="Read">'
+            '<｜｜DSML｜｜ parameter name="file_path" string="true">a.py'
+            "</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>",
+        ],
+        tools_expected=True,
+    )
+    assert content == ""
+    assert calls == [("Read", {"file_path": "a.py"})]
+
+
 def test_translator_keeps_quoted_call_marker_as_text() -> None:
     content, calls = translate(
         ["格式是 <tool_call> 这样写\n", "结束"], tools_expected=True

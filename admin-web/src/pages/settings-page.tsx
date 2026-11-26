@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { apiDelete, apiGet, apiPatch, apiPost } from "../lib/api";
 import type {
   AdminSettings,
+  CheckinAutoStatus,
   ConcurrencyInfo,
   InstanceInfo,
   UpdateInfo,
@@ -90,6 +91,11 @@ export function SettingsPage() {
     queryFn: () => apiGet<UpdateInfo>("/update", { silent: true }),
     refetchInterval: 3_600_000,
     staleTime: 3_600_000,
+  });
+  const autoCheckinQuery = useQuery({
+    queryKey: ["admin", "checkin-auto"],
+    queryFn: () => apiGet<CheckinAutoStatus>("/checkin/auto"),
+    refetchInterval: 30_000,
   });
 
   const settings = useMemo(() => {
@@ -265,6 +271,14 @@ export function SettingsPage() {
     }, 400);
   }
 
+  // 时刻输入过程中会有不完整的值，填完整了再保存
+  function saveCheckinTime(value: string) {
+    setValues((current) => ({ ...current, checkin_auto_time: value }));
+    if (/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+      saveMutation.mutate({ key: "checkin_auto_time", value });
+    }
+  }
+
   async function changePassword(event: React.FormEvent) {
     event.preventDefault();
     if (newPassword.length < 8) {
@@ -347,6 +361,30 @@ export function SettingsPage() {
                 {passwordPending ? "更新中…" : "更新密码"}
               </Button>
             </form>
+          </SectionCard>
+
+          <SectionCard
+            title="自动签到"
+            description="每天在设定时刻给全部启用账号签到，当天没签成的每 30 分钟补签一次，至 23:30"
+          >
+            <div className="grid gap-3 md:grid-cols-2">
+              <ToggleRow
+                label="每日自动签到"
+                hint="被上游限流的账号会冷却 15 分钟并自动更换设备号"
+                checked={Boolean(values.checkin_auto)}
+                onChange={(checked) => setField("checkin_auto", checked)}
+              />
+              <div className="flex flex-col gap-1.5 rounded-tile border border-border bg-canvas px-3 py-2.5">
+                <Label htmlFor="checkin-auto-time">每日签到时刻</Label>
+                <Input
+                  id="checkin-auto-time"
+                  type="time"
+                  value={String(values.checkin_auto_time ?? "09:00")}
+                  onChange={(event) => saveCheckinTime(event.target.value)}
+                />
+              </div>
+            </div>
+            <AutoCheckinStatusLines status={autoCheckinQuery.data} />
           </SectionCard>
 
           <div className="grid gap-4 lg:grid-cols-2">
@@ -651,6 +689,46 @@ function TextField({
         value={value === undefined || value === null ? "" : String(value)}
         onChange={(event) => onChange(event.target.value)}
       />
+    </div>
+  );
+}
+
+function describeClock(epoch: number): string {
+  const date = new Date(epoch * 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getMonth() + 1}/${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function AutoCheckinStatusLines({ status }: { status?: CheckinAutoStatus }) {
+  if (!status) {
+    return <p className="mt-3 text-xs text-muted">正在读取自动签到状态…</p>;
+  }
+  const last = status.last;
+  return (
+    <div className="mt-3 space-y-1 text-xs text-muted">
+      {!status.time_valid ? (
+        <p className="text-danger">签到时刻格式无效，自动签到没有运行，请改成 HH:MM。</p>
+      ) : null}
+      {status.enabled && status.next_run ? (
+        <p>
+          {status.running ? "正在签到…" : `下次签到：${describeClock(status.next_run)}`}
+        </p>
+      ) : (
+        <p>自动签到未开启，可在账号页手动签到。</p>
+      )}
+      {last ? (
+        <p>
+          上次（{describeClock(last.at)}）：已签 {last.signed} · 限流 {last.rate_limited} · 失败{" "}
+          {last.failed} · 共 {last.total}
+        </p>
+      ) : (
+        <p>还没有运行过。</p>
+      )}
+      {status.enabled && status.pending.length > 0 && !status.running ? (
+        <p>
+          还有 {status.pending.length} 个账号没签成，冷却期满后自动补签。
+        </p>
+      ) : null}
     </div>
   );
 }

@@ -116,6 +116,51 @@ def test_tool_block_filter_holds_partial_dsml_marker() -> None:
     assert calls == [{"name": "Read", "arguments": {"file_path": "c.py"}}]
 
 
+def test_tool_block_filter_holds_fullwidth_dsml_marker_split_across_chunks() -> None:
+    # DeepSeek 实际输出的是全角竖线，标记前半截经常单独成一个数据块
+    flt = ide_chat.ToolBlockFilter()
+    visible, calls = flt.feed("我来看一下 <｜｜DSML｜｜")
+    assert visible == "我来看一下 "
+    assert calls == []
+
+    visible, calls = flt.feed(
+        "我来看一下 <｜｜DSML｜｜ calls>\n"
+        '<｜｜DSML｜｜ invoke name="Bash">'
+        '<｜｜DSML｜｜ parameter name="arguments" string="false">'
+        '{"command":"dir"}</｜｜DSML｜｜ parameter>\n'
+        "</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>"
+    )
+    assert visible == "我来看一下 "
+    assert calls == [{"name": "Bash", "arguments": {"command": "dir"}}]
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "<｜｜DSML｜｜ calls>",
+        "<||DSML||tool_calls>",
+        "<|DSML|calls>",
+        "< | | DSML | | calls>",
+    ],
+)
+def test_tool_block_filter_holds_every_split_of_the_opening_tag(opening) -> None:
+    # 开头标记在任意位置被数据块切开，都不能漏出记号
+    body = (
+        '<｜｜DSML｜｜ invoke name="Read">'
+        '<｜｜DSML｜｜ parameter name="file_path" string="true">d.py'
+        "</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>"
+    )
+    for cut in range(1, len(opening)):
+        flt = ide_chat.ToolBlockFilter()
+        visible, calls = flt.feed("前缀 " + opening[:cut])
+        assert visible == "前缀 ", f"{opening!r} split at {cut} leaked {visible!r}"
+        assert calls == []
+
+        visible, calls = flt.feed("前缀 " + opening + body + "</｜｜DSML｜｜ calls>")
+        assert visible == "前缀 "
+        assert calls == [{"name": "Read", "arguments": {"file_path": "d.py"}}]
+
+
 def test_tool_block_filter_recovers_native_tool_call_json() -> None:
     flt = ide_chat.ToolBlockFilter()
     text = (

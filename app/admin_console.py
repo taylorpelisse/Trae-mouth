@@ -17,6 +17,7 @@ from .accounts.router import AccountRouter
 from .accounts.store import AccountStore, STATUS_ACTIVE
 from .admin import AdminStore
 from .api_keys import ApiKeyStore
+from . import checkin as checkin_service
 from .config import Config
 from .db import Database
 from .security import now_ts
@@ -75,6 +76,7 @@ def create_admin_console_router(
     model_catalog_for: Any,
     version: str,
     started_at: int,
+    checkin: Any,
     transport: Any = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/admin/api")
@@ -125,6 +127,8 @@ def create_admin_console_router(
             "auth_host": config.trae_auth_host,
             "client_id": config.trae_client_id,
             "allow_local_import": config.allow_local_import,
+            "checkin_auto": config.checkin_auto,
+            "checkin_auto_time": config.checkin_auto_time,
             "version": version,
         }
         return raw
@@ -749,33 +753,8 @@ def create_admin_console_router(
             "supported": True,
         }
 
-    def record_checkin_credit(account_id: str, amount: Any) -> bool:
-        try:
-            value = float(amount)
-        except (TypeError, ValueError):
-            return False
-        if value <= 0:
-            return False
-        start = int(
-            dt.datetime.combine(dt.date.today(), dt.time.min).timestamp()
-        )
-        with db.tx() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM credit_events WHERE account_id = ? "
-                "AND reason = 'checkin' AND created_at >= ? LIMIT 1",
-                (account_id, start),
-            ).fetchone()
-            if exists:
-                return False
-            conn.execute(
-                "INSERT INTO credit_events(account_id, amount, reason, created_at) "
-                "VALUES(?,?,?,?)",
-                (account_id, value, "checkin", now_ts()),
-            )
-        return True
-
     @router.post("/activity/checkin/account")
-    async def checkin(
+    async def checkin_account(
         body: CheckinBody, _: str = Depends(current_admin)
     ) -> dict[str, Any]:
         account = accounts.get(body.account_id)
@@ -786,48 +765,15 @@ def create_admin_console_router(
                 "ok": False,
                 "already": False,
                 "claimed": False,
+                "rate_limited": False,
                 "code": 0,
                 "message": "account not found",
             }
-        secrets = accounts.get_secrets(account.id)
-        device = accounts.get_device(account.id)
-        status = await activity.checkin_status(
-            config, secrets.token, device, transport=transport
-        )
-        status_data = status.get("data") if isinstance(status.get("data"), dict) else {}
-        if status_data.get("checked_in") or status_data.get("did_checked_in"):
-            amount = status_data.get("credits") or status_data.get("extra_credits")
-            recorded = record_checkin_credit(account.id, amount)
-            return {
-                "account_id": account.id,
-                "account_label": account.label or account.username or account.id,
-                "ok": True,
-                "already": True,
-                "claimed": False,
-                "code": status.get("code") or 0,
-                "message": "already checked in",
-                "income": amount if recorded else 0,
-            }
-        claim = await activity.checkin_claim(
-            config, secrets.token, device, transport=transport
-        )
-        claim_data = claim.get("data") if isinstance(claim.get("data"), dict) else {}
-        amount = claim_data.get("credits") or claim_data.get("extra_credits")
-        claimed = bool(claim.get("ok")) and not claim_data.get("risk")
-        recorded = False
-        if claimed:
-            recorded = record_checkin_credit(account.id, amount)
-        return {
-            "account_id": account.id,
-            "account_label": account.label or account.username or account.id,
-            "ok": bool(claim.get("ok")),
-            "already": False,
-            "claimed": claimed,
-            "code": claim.get("code") or 0,
-            "message": claim.get("message") or "",
-            "risk": bool(claim_data.get("risk")),
-            "income": amount if recorded else 0,
-        }
+        return await checkin.run(account)
+
+    @router.get("/checkin/auto")
+    def checkin_auto(_: str = Depends(current_admin)) -> dict[str, Any]:
+        return checkin_service.AutoCheckin(checkin).status()
 
     @router.post("/accounts/refresh-all")
     async def refresh_all(_: str = Depends(current_admin)) -> dict[str, Any]:
@@ -921,6 +867,8 @@ def create_admin_console_router(
             "history_max_messages",
             "model_gateway",
             "web_api_base",
+            "checkin_auto",
+            "checkin_auto_time",
         }
         unknown = [key for key in values if key not in allowed]
         if unknown:
@@ -985,6 +933,17 @@ def create_admin_console_router(
                 config.model_gateway = str(value).rstrip("/")
             elif key == "web_api_base":
                 config.web_api_base = str(value).rstrip("/")
+            elif key == "checkin_auto":
+                config.checkin_auto = bool(value)
+                values[key] = config.checkin_auto
+            elif key == "checkin_auto_time":
+                text = checkin_service.normalize_time(value)
+                if not text:
+                    raise HTTPException(
+                        status_code=400, detail="签到时刻需写成 HH:MM，例如 09:00"
+                    )
+                config.checkin_auto_time = text
+                values[key] = text
             changed.append(key)
         persist_map = {
             "account_max_concurrency": "default_concurrency",
@@ -1009,6 +968,8 @@ def create_admin_console_router(
             "history_max_messages",
             "model_gateway",
             "web_api_base",
+            "checkin_auto",
+            "checkin_auto_time",
         }
         for key in changed:
             target = persist_map.get(key, key)

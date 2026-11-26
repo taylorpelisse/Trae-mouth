@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Optional
 
 import httpx
@@ -8,6 +9,28 @@ from ..accounts.models import DeviceProfile
 from ..config import Config
 
 DESKTOP_UA = "Trae/2.3.105403"
+
+# 签到接口按设备号限流（返回 9074「参与用户太多」），所以签到不用登录时的设备号，
+# 而是每个账号单独推导一个设备号，被限后换下一代。9095 表示该设备号已为别的账号签过。
+CHECKIN_DEVICE_BRAND = "ASUS TUF Gaming A15 FA507RM_FA507RM"
+CHECKIN_RATE_LIMIT_CODES = {9074, 9095}
+
+
+def checkin_device_id(identity: str, generation: int = 0) -> str:
+    """账号绑定的 16 位签到设备号；换一代就是一个全新的设备号。"""
+    material = identity if generation <= 0 else f"{identity}#gen{generation}"
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return str(int(digest, 16) % 10**16).zfill(16)
+
+
+def checkin_headers(token: str, device_id: str) -> dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "Authorization": f"Cloud-IDE-JWT {token}",
+        "x-device-id": device_id,
+        "x-device-brand": CHECKIN_DEVICE_BRAND,
+        "x-device-type": "windows",
+    }
 
 
 def _headers(
@@ -43,6 +66,7 @@ async def post(
     body: dict[str, Any],
     *,
     transport: Optional[httpx.AsyncBaseTransport] = None,
+    headers: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
     url = config.trae_auth_host.rstrip("/") + path
     timeout = httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=15.0)
@@ -51,7 +75,7 @@ async def post(
             timeout=timeout, transport=transport
         ) as client:
             response = await client.post(
-                url, headers=_headers(config, token, device), json=body
+                url, headers=headers or _headers(config, token, device), json=body
             )
         try:
             data = response.json()
@@ -66,6 +90,7 @@ async def post(
             "ok": ok,
             "status": response.status_code,
             "code": code,
+            "rate_limited": code in CHECKIN_RATE_LIMIT_CODES,
             "message": message or ("" if ok else f"HTTP {response.status_code}"),
             "data": data,
         }
@@ -74,6 +99,7 @@ async def post(
             "ok": False,
             "status": 0,
             "code": None,
+            "rate_limited": False,
             "message": f"{type(exc).__name__}: {exc}"[:300],
             "data": None,
         }
@@ -99,34 +125,38 @@ async def credit_usage(
 async def checkin_status(
     config: Config,
     token: str,
-    device: Optional[DeviceProfile],
+    identity: str,
     *,
+    generation: int = 0,
     transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> dict[str, Any]:
     return await post(
         config,
         token,
-        device,
+        None,
         "/trae/api/v2/ug/checkin_credits/status",
-        {"req_source": 1},
+        {},
         transport=transport,
+        headers=checkin_headers(token, checkin_device_id(identity, generation)),
     )
 
 
 async def checkin_claim(
     config: Config,
     token: str,
-    device: Optional[DeviceProfile],
+    identity: str,
     *,
+    generation: int = 0,
     transport: Optional[httpx.AsyncBaseTransport] = None,
 ) -> dict[str, Any]:
     return await post(
         config,
         token,
-        device,
+        None,
         "/trae/api/v2/ug/checkin_credits/claim",
-        {"req_source": 1},
+        {},
         transport=transport,
+        headers=checkin_headers(token, checkin_device_id(identity, generation)),
     )
 
 
