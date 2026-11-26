@@ -6,6 +6,8 @@ import type {
   AdminSettings,
   ConcurrencyInfo,
   InstanceInfo,
+  MaintenanceJob,
+  MaintenanceStatus,
   UpdateInfo,
   UpdateJob,
   UpdateStatus,
@@ -90,6 +92,11 @@ export function SettingsPage() {
     queryFn: () => apiGet<UpdateInfo>("/update", { silent: true }),
     refetchInterval: 3_600_000,
     staleTime: 3_600_000,
+  });
+  const maintenanceQuery = useQuery({
+    queryKey: ["admin", "maintenance"],
+    queryFn: () => apiGet<MaintenanceStatus>("/maintenance"),
+    refetchInterval: 15_000,
   });
 
   const settings = useMemo(() => {
@@ -265,6 +272,13 @@ export function SettingsPage() {
     }, 400);
   }
 
+  // 积分刷新时刻可以填多个，全部写合法了才保存
+  function saveCreditTimes(value: string) {
+    setValues((current) => ({ ...current, credit_refresh_times: value }));
+    if (splitTimes(value) === null) return;
+    saveMutation.mutate({ key: "credit_refresh_times", value });
+  }
+
   async function changePassword(event: React.FormEvent) {
     event.preventDefault();
     if (newPassword.length < 8) {
@@ -347,6 +361,51 @@ export function SettingsPage() {
                 {passwordPending ? "更新中…" : "更新密码"}
               </Button>
             </form>
+          </SectionCard>
+
+          <SectionCard
+            title="账号设置"
+            description="针对全部账号的定时任务和批量刷新都按错峰方式执行：每次打乱顺序，账号之间留出间隔和随机抖动"
+          >
+            <div className="grid gap-3 md:grid-cols-2">
+              <NumberField
+                label="账号间隔（秒）"
+                hint="每个账号之间至少隔多久"
+                value={values.account_stagger_seconds}
+                onChange={(value) => setField("account_stagger_seconds", value)}
+              />
+              <NumberField
+                label="随机抖动上限（秒）"
+                hint="在间隔之上再随机多等一段时间"
+                value={values.account_jitter_seconds}
+                onChange={(value) => setField("account_jitter_seconds", value)}
+              />
+              <TimeField
+                label="令牌刷新时刻"
+                hint="每天这时处理即将到期的令牌；留空则只保留每小时的兜底检查"
+                value={values.token_refresh_time}
+                onChange={(value) => setField("token_refresh_time", value)}
+              />
+              <NumberField
+                label="令牌刷新提前量（小时）"
+                hint="令牌剩余不足这么多时间才刷新，与真实客户端一致默认 24"
+                value={values.token_refresh_margin_hours}
+                onChange={(value) => setField("token_refresh_margin_hours", value)}
+              />
+              <TimeField
+                label="账号保活时刻"
+                hint="每天这时逐个账号确认状态；留空则关闭"
+                value={values.keepalive_time}
+                onChange={(value) => setField("keepalive_time", value)}
+              />
+              <TextField
+                label="积分刷新时刻"
+                hint="多个用逗号隔开，例如 08:30, 14:30, 20:30；留空则关闭"
+                value={values.credit_refresh_times}
+                onChange={saveCreditTimes}
+              />
+            </div>
+            <MaintenanceStatusLines status={maintenanceQuery.data} />
           </SectionCard>
 
           <div className="grid gap-4 lg:grid-cols-2">
@@ -616,10 +675,12 @@ const BOOLEAN_HINTS: Record<string, string> = {
 
 function NumberField({
   label,
+  hint,
   value,
   onChange,
 }: {
   label: string;
+  hint?: string;
   value: unknown;
   onChange: (value: number) => void;
 }) {
@@ -631,16 +692,19 @@ function NumberField({
         value={value === undefined || value === null ? "" : String(value)}
         onChange={(event) => onChange(Number(event.target.value.replace(/[^\d.-]/g, "")))}
       />
+      {hint ? <p className="text-xs text-muted">{hint}</p> : null}
     </div>
   );
 }
 
 function TextField({
   label,
+  hint,
   value,
   onChange,
 }: {
   label: string;
+  hint?: string;
   value: unknown;
   onChange: (value: string) => void;
 }) {
@@ -651,6 +715,88 @@ function TextField({
         value={value === undefined || value === null ? "" : String(value)}
         onChange={(event) => onChange(event.target.value)}
       />
+      {hint ? <p className="text-xs text-muted">{hint}</p> : null}
+    </div>
+  );
+}
+
+function TimeField({
+  label,
+  hint,
+  value,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  value: unknown;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Label>{label}</Label>
+      <Input
+        type="time"
+        value={value === undefined || value === null ? "" : String(value)}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      {hint ? <p className="text-xs text-muted">{hint}</p> : null}
+    </div>
+  );
+}
+
+const TIME_PART = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+/** 拆出多个时刻；返回 null 表示还有没写完整的项。 */
+function splitTimes(value: string): string[] | null {
+  const parts = value
+    .trim()
+    .split(/[,，;；\s]+/)
+    .filter(Boolean);
+  return parts.every((part) => TIME_PART.test(part)) ? parts : null;
+}
+
+function describeClock(epoch: number): string {
+  const date = new Date(epoch * 1000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${date.getMonth() + 1}/${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function describeSummary(job: MaintenanceJob): string {
+  if (job.running) return "进行中…";
+  if (!job.slots.length) return "未设定时刻";
+  return job.next_run ? `下次 ${describeClock(job.next_run)}` : "今天已完成";
+}
+
+function describeLast(job: MaintenanceJob): string {
+  const last = job.last;
+  if (!last) return "还没有运行过";
+  return `上次（${describeClock(last.finished)}）：成功 ${last.ok} · 失败 ${last.failed} · 跳过 ${last.skipped} · 共 ${last.total}`;
+}
+
+function MaintenanceStatusLines({ status }: { status?: MaintenanceStatus }) {
+  if (!status) {
+    return <p className="mt-3 text-xs text-muted">正在读取账号维护状态…</p>;
+  }
+  const { jobs, safety, endpoints, invalid_times: invalid } = status;
+  return (
+    <div className="mt-3 space-y-1 text-xs text-muted">
+      {invalid.token_refresh_time ? (
+        <p className="text-danger">令牌刷新时刻格式无效，这个定时任务没有运行，请改成 HH:MM 或留空。</p>
+      ) : null}
+      {invalid.keepalive_time ? (
+        <p className="text-danger">账号保活时刻格式无效，这个定时任务没有运行，请改成 HH:MM 或留空。</p>
+      ) : null}
+      {invalid.credit_refresh_times ? (
+        <p className="text-danger">积分刷新时刻格式无效，这个定时任务没有运行，请写成 HH:MM，多个用逗号隔开或留空。</p>
+      ) : null}
+      <p>令牌刷新：{describeSummary(jobs.token)}；{describeLast(jobs.token)}</p>
+      <p>令牌兜底检查：每小时一次，{safety.next_run ? `下次 ${describeClock(safety.next_run)}` : "—"}。</p>
+      <p>账号保活：{describeSummary(jobs.keepalive)}；{describeLast(jobs.keepalive)}</p>
+      <p>积分刷新：{describeSummary(jobs.credits)}；{describeLast(jobs.credits)}</p>
+      <p>
+        刷新接口：{endpoints.native} 个账号走带设备签名的原生接口，{endpoints.legacy} 个未绑定设备只能走旧接口，
+        {endpoints.unknown} 个待判断。
+      </p>
     </div>
   );
 }

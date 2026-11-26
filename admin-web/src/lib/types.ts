@@ -260,6 +260,48 @@ export type CheckinAutoStatus = {
   cooldown: Record<string, number>;
 };
 
+export type MaintenanceItem = {
+  account_id: string;
+  label: string;
+  status: "ok" | "skipped" | "failed";
+  detail: string;
+};
+
+export type MaintenanceSummary = {
+  job: string;
+  trigger: string;
+  label: string;
+  at: number;
+  finished: number;
+  total: number;
+  ok: number;
+  failed: number;
+  skipped: number;
+  items: MaintenanceItem[];
+};
+
+export type MaintenanceJob = {
+  label: string;
+  slots: string[];
+  next_run: number | null;
+  running: boolean;
+  last: MaintenanceSummary | null;
+};
+
+export type MaintenanceStatus = {
+  ok: boolean;
+  stagger_seconds: number;
+  jitter_seconds: number;
+  token_refresh_time: string;
+  token_refresh_margin_hours: number;
+  keepalive_time: string;
+  credit_refresh_times: string[];
+  invalid_times: Record<string, boolean>;
+  safety: { next_run: number; last: MaintenanceSummary | null };
+  jobs: Record<string, MaintenanceJob>;
+  endpoints: { native: number; legacy: number; unknown: number };
+};
+
 export type PlaygroundResult = {
   content: string;
   reasoning: string;

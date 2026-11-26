@@ -22,6 +22,13 @@ from .store import (
 
 logger = logging.getLogger(__name__)
 
+# 令牌只剩这么多时间时的刷新属于紧急情况，由刷新器自己的线程处理
+URGENT_WINDOW = 600
+# 刷新失败后的等待时间，逐次加长
+FAILURE_BACKOFF = (300, 900, 3600, 21600)
+# 上游判定「令牌与设备不匹配」时接口模块给出的原因
+MISMATCH = "native: token device not match"
+
 
 @dataclass
 class RefreshResult:
@@ -29,6 +36,8 @@ class RefreshResult:
     ok: bool
     skipped: bool = False
     message: str = ""
+    endpoint: str = ""
+    retry_after: int = 0
 
 
 class TokenRefresher:
@@ -67,6 +76,42 @@ class TokenRefresher:
                 self._locks[account_id] = lock
             return lock
 
+    # -- per-account memory ------------------------------------------------
+    # 都存在数据库的设置表里，服务重启后仍然有效。
+
+    def _setting(self, key: str, account_id: str) -> str:
+        return self.store.db.get_setting(f"refresh:{key}:{account_id}")
+
+    def _set_setting(self, key: str, account_id: str, value: str) -> None:
+        self.store.db.set_setting(f"refresh:{key}:{account_id}", value)
+
+    def _legacy_only(self, account_id: str) -> bool:
+        """这个账号是否已确认不能用本设备的密钥刷新。
+
+        登录或导入会带来新的令牌，那时这条记录会被清掉，重新尝试原生接口。
+        """
+        return self._setting("endpoint", account_id) == "legacy"
+
+    def _retry_at(self, account_id: str) -> int:
+        try:
+            return int(self._setting("retry_at", account_id) or 0)
+        except ValueError:
+            return 0
+
+    def _note_failure(self, account_id: str) -> int:
+        try:
+            failures = int(self._setting("failures", account_id) or 0) + 1
+        except ValueError:
+            failures = 1
+        delay = FAILURE_BACKOFF[min(failures - 1, len(FAILURE_BACKOFF) - 1)]
+        self._set_setting("failures", account_id, str(failures))
+        self._set_setting("retry_at", account_id, str(now_ts() + delay))
+        return delay
+
+    def _note_success(self, account_id: str) -> None:
+        self._set_setting("failures", account_id, "0")
+        self._set_setting("retry_at", account_id, "0")
+
     def refresh(self, account_id: str, *, force: bool = False) -> RefreshResult:
         record = self.store.get(account_id)
         if not record:
@@ -91,6 +136,15 @@ class TokenRefresher:
                 and secrets.token_expires_at - now > self.refresh_window
             ):
                 return RefreshResult(account_id, True, skipped=True, message="not due")
+            retry_at = self._retry_at(account_id)
+            if not force and retry_at > now:
+                return RefreshResult(
+                    account_id,
+                    True,
+                    skipped=True,
+                    message="waiting to retry",
+                    retry_after=retry_at - now,
+                )
             if not secrets.refresh_token:
                 if secrets.token_expires_at and secrets.token_expires_at > now:
                     return RefreshResult(
@@ -147,9 +201,11 @@ class TokenRefresher:
                     private_key_pem=private_key,
                     ide_version=self.app_version,
                     use_device_info=self.use_device_info,
+                    skip_native=self._legacy_only(account_id),
                 )
             except oauth.ImportError_ as exc:
                 message = str(exc)
+                retry_after = self._note_failure(account_id)
                 auth_failure = any(
                     marker in message
                     for marker in (
@@ -178,8 +234,18 @@ class TokenRefresher:
                 else:
                     self.store.mark_error(account_id, message)
                     self.store.log_event(account_id, "token_refresh_failed", message)
-                return RefreshResult(account_id, False, message=message)
+                return RefreshResult(
+                    account_id, False, message=message, retry_after=retry_after
+                )
 
+            endpoint = str(exchanged.get("endpoint") or "legacy")
+            native_error = str(exchanged.get("native_error") or "")
+            if endpoint == "native":
+                self._set_setting("endpoint", account_id, "native")
+            elif native_error == MISMATCH:
+                # 令牌不是用本设备的密钥签发的：以后不再反复尝试原生接口
+                self._set_setting("endpoint", account_id, "legacy")
+            self._note_success(account_id)
             tokens = TokenBundle(
                 token=exchanged["token"],
                 refresh_token=exchanged.get("refresh_token") or secrets.refresh_token,
@@ -193,13 +259,16 @@ class TokenRefresher:
                 self.store.set_status(
                     account_id, STATUS_ACTIVE, "", actor="refresher"
                 )
-            self.store.log_event(
-                account_id,
-                "token_refresh_ok",
-                f"endpoint={exchanged.get('endpoint', '')}",
+            detail = f"endpoint={endpoint}"
+            if endpoint == "legacy" and native_error == MISMATCH:
+                detail = "endpoint=legacy (token not bound to this device)"
+            elif endpoint == "legacy" and native_error:
+                detail = f"endpoint=legacy ({native_error[:160]})"
+            self.store.log_event(account_id, "token_refresh_ok", detail)
+            logger.info("account %s token refreshed via %s", account_id, endpoint)
+            return RefreshResult(
+                account_id, True, message="refreshed", endpoint=endpoint
             )
-            logger.info("account %s token refreshed", account_id)
-            return RefreshResult(account_id, True, message="refreshed")
         finally:
             lock.release()
 
@@ -217,10 +286,27 @@ class TokenRefresher:
         return due
 
     def refresh_due(self) -> list[RefreshResult]:
+        """刷新窗口内的账号依次刷新，账号之间不加间隔。
+
+        定时任务请用调度器，它会打乱顺序并在账号之间错峰。
+        """
         results: list[RefreshResult] = []
         for record in self.due_accounts():
             results.append(self.refresh(record.id))
         return results
+
+    def urgent_accounts(self) -> list[AccountRecord]:
+        """令牌马上就过期的账号，等不到下一次定时刷新。"""
+        now = now_ts()
+        due: list[AccountRecord] = []
+        for record in self.store.list():
+            if record.status in {STATUS_DISABLED, STATUS_RELOGIN, STATUS_INVALID}:
+                continue
+            if not record.has_refresh_token or not record.token_expires_at:
+                continue
+            if record.token_expires_at - now <= URGENT_WINDOW:
+                due.append(record)
+        return due
 
     def clear_expired_cooldowns(self) -> None:
         now = now_ts()
@@ -235,10 +321,12 @@ class TokenRefresher:
                 )
 
     def _loop(self) -> None:
+        # 到期前的定时刷新由调度器按错峰方式处理；这里只兜底处理马上过期的令牌
         while not self._stop.is_set():
             try:
                 self.clear_expired_cooldowns()
-                self.refresh_due()
+                for record in self.urgent_accounts():
+                    self.refresh(record.id)
             except Exception:
                 logger.exception("token refresher iteration failed")
             self._stop.wait(self.interval)

@@ -104,8 +104,9 @@ class Config:
     port: int = 18792
     session_ttl: int = 7 * 86400
     import_code_ttl: int = 600
-    refresh_window: int = 1800
-    refresh_device_info: bool = False
+    refresh_window: int = 86400
+    # 刷新令牌时先走带设备签名的原生接口，与真实客户端一致
+    refresh_device_info: bool = True
     refresh_interval: int = 300
     default_concurrency: int = 3
     model_catalog_ttl: int = 300
@@ -128,6 +129,13 @@ class Config:
     # 每日自动签到：开关与当天的发起时刻（HH:MM）
     checkin_auto: bool = False
     checkin_auto_time: str = "09:00"
+    # 账号维护：账号之间的间隔与抖动，以及令牌刷新、保活、积分刷新的时刻
+    account_stagger_seconds: int = 10
+    account_jitter_seconds: int = 60
+    token_refresh_time: str = "04:30"
+    token_refresh_margin_hours: int = 24
+    keepalive_time: str = "10:30"
+    credit_refresh_times: str = "08:30,14:30,20:30"
 
     trae_auth_host: str = "https://api.trae.cn"
     trae_client_id: str = "ono9krqynydwx5"
@@ -174,8 +182,8 @@ class Config:
             port=_env_int("TRAE_MOUTH_PORT", 18792),
             session_ttl=_env_int("TRAE_MOUTH_SESSION_TTL", 7 * 86400),
             import_code_ttl=_env_int("TRAE_MOUTH_IMPORT_CODE_TTL", 600),
-            refresh_window=_env_int("TRAE_MOUTH_REFRESH_WINDOW", 1800),
-            refresh_device_info=_env_bool("TRAE_REFRESH_DEVICE_INFO", False),
+            refresh_window=_env_int("TRAE_MOUTH_REFRESH_WINDOW", 86400),
+            refresh_device_info=_env_bool("TRAE_REFRESH_DEVICE_INFO", True),
             refresh_interval=_env_int("TRAE_MOUTH_REFRESH_INTERVAL", 300),
             default_concurrency=_env_int("TRAE_MOUTH_DEFAULT_CONCURRENCY", 3),
             model_catalog_ttl=_env_int("TRAE_MOUTH_MODEL_CATALOG_TTL", 300),

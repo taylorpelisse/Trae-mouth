@@ -85,6 +85,23 @@ def _normalize_exchange(
     )
 
 
+DEVICE_MISMATCH_CODE = "20403"
+DEVICE_MISMATCH_MARKER = "device not match"
+
+
+def device_mismatch(response_status: int, body: Any) -> bool:
+    """上游判定「令牌与设备不匹配」：这个账号的令牌不是用当前设备密钥签发的。"""
+    if response_status != 401 or not isinstance(body, dict):
+        return False
+    metadata = body.get("ResponseMetadata") or {}
+    error = metadata.get("Error") if isinstance(metadata, dict) else None
+    if not isinstance(error, dict):
+        return False
+    code = str(error.get("Code") or "")
+    message = str(error.get("Message") or "")
+    return code == DEVICE_MISMATCH_CODE or DEVICE_MISMATCH_MARKER in message.lower()
+
+
 def exchange_refresh_token(
     refresh_token: str,
     *,
@@ -97,18 +114,27 @@ def exchange_refresh_token(
     private_key_pem: str = "",
     ide_version: str = "",
     use_device_info: bool = True,
+    skip_native: bool = False,
 ) -> dict[str, Any]:
     """Exchange a Trae refresh token for a Cloud-IDE-JWT.
 
     Uses the native device-bound exchange first when a device key is available,
-    then falls back to the legacy web exchange.
+    then falls back to the legacy web exchange.  ``skip_native`` goes straight
+    to the legacy exchange for accounts known not to be bound to this device.
     """
     if not refresh_token:
         raise ImportError_("refresh token is empty")
     base = (host or "https://api.trae.cn").rstrip("/")
     errors: list[str] = []
+    native_error = ""
     with httpx.Client(timeout=timeout, transport=transport) as client:
-        if use_device_info and device and private_key_pem and device.public_key:
+        if (
+            use_device_info
+            and not skip_native
+            and device
+            and private_key_pem
+            and device.public_key
+        ):
             native_path = "/trae/api/v3/oauth/ExchangeToken"
             try:
                 payload = {
@@ -127,8 +153,14 @@ def exchange_refresh_token(
                 }
             except Exception as exc:
                 errors.append(f"native proof failed: {exc}")
+                native_error = f"native proof failed: {exc}"
             else:
-                response = client.post(base + native_path, json=payload)
+                app_version = ide_version or device.app_version
+                response = client.post(
+                    base + native_path,
+                    json=payload,
+                    headers={"User-Agent": f"Trae/{app_version}"} if app_version else None,
+                )
                 body: Any = None
                 try:
                     body = response.json()
@@ -145,11 +177,15 @@ def exchange_refresh_token(
                     if parsed:
                         return parsed
                     errors.append(f"native: {error}")
+                    native_error = f"native: {error}"
                 else:
                     detail = response.text[:300] if body is None else ""
-                    errors.append(
+                    native_error = (
                         f"native HTTP {response.status_code}: {detail}".rstrip()
                     )
+                    if device_mismatch(response.status_code, body):
+                        native_error = "native: token device not match"
+                    errors.append(native_error)
 
         legacy_url = f"{base}/cloudide/api/v3/trae/oauth/ExchangeToken"
         payload = {
@@ -173,6 +209,8 @@ def exchange_refresh_token(
                 endpoint="legacy",
             )
             if parsed:
+                # 记下原生接口为什么没用上，方便判断这个账号是否绑定到了本设备
+                parsed["native_error"] = native_error
                 return parsed
             errors.append(f"legacy: {error}")
         else:

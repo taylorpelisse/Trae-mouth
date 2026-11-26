@@ -41,6 +41,7 @@ from .accounts.store import (
 from .admin import AdminStore, LoginLimiter
 from . import update as update_service
 from . import checkin as checkin_service
+from . import maintenance as maintenance_service
 from .admin_console import create_admin_console_router
 from .api.openai_routes import create_openai_router
 from .api_keys import ApiKeyStore
@@ -60,7 +61,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.2.9"
+VERSION = "0.3.0"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"
@@ -344,6 +345,12 @@ PERSISTED_SETTING_KEYS = (
     "web_api_base",
     "checkin_auto",
     "checkin_auto_time",
+    "account_stagger_seconds",
+    "account_jitter_seconds",
+    "token_refresh_time",
+    "token_refresh_margin_hours",
+    "keepalive_time",
+    "credit_refresh_times",
 )
 
 
@@ -358,6 +365,9 @@ def _apply_persisted_settings(config: Config, db: Database) -> None:
             continue
         if hasattr(config, key):
             setattr(config, key, value)
+    # 提前量按小时设置，刷新器用的是秒
+    hours = int(getattr(config, "token_refresh_margin_hours", 24) or 24)
+    config.refresh_window = max(1, min(24 * 14, hours)) * 3600
 
 
 async def _scheduled_update_check() -> None:
@@ -381,6 +391,15 @@ async def _auto_checkin_loop(service: Any) -> None:
             await auto.tick()
         except Exception:
             logger.exception("auto check-in failed")
+
+
+async def _maintenance_loop(service: Any) -> None:
+    while True:
+        await asyncio.sleep(20)
+        try:
+            await service.tick()
+        except Exception:
+            logger.exception("account maintenance failed")
 
 
 def create_app(
@@ -418,6 +437,13 @@ def create_app(
         ide_version_code=config.ide_version_code,
         use_device_info=config.refresh_device_info,
     )
+    maintenance = maintenance_service.AccountMaintenance(
+        config=config,
+        db=db,
+        accounts=accounts,
+        refresher=refresher,
+        transport=transport,
+    )
 
     http_client: Optional[httpx.AsyncClient] = None
     if transport is None:
@@ -443,6 +469,7 @@ def create_app(
         refresher.start()
         update_task = asyncio.create_task(_scheduled_update_check())
         auto_checkin_task = asyncio.create_task(_auto_checkin_loop(checkin))
+        maintenance_task = asyncio.create_task(_maintenance_loop(maintenance))
         try:
             yield
         finally:
@@ -454,6 +481,11 @@ def create_app(
             auto_checkin_task.cancel()
             try:
                 await auto_checkin_task
+            except asyncio.CancelledError:
+                pass
+            maintenance_task.cancel()
+            try:
+                await maintenance_task
             except asyncio.CancelledError:
                 pass
             refresher.stop()
@@ -481,6 +513,7 @@ def create_app(
     app.state.transport = transport
     app.state.http_client = http_client
     app.state.checkin = checkin
+    app.state.maintenance = maintenance
     app.state.started_at = now_ts()
     account_router = AccountRouter(
         accounts,
@@ -1066,6 +1099,12 @@ def create_app(
             "client_id": config.trae_client_id,
             "checkin_auto": config.checkin_auto,
             "checkin_auto_time": config.checkin_auto_time,
+            "account_stagger_seconds": config.account_stagger_seconds,
+            "account_jitter_seconds": config.account_jitter_seconds,
+            "token_refresh_time": config.token_refresh_time,
+            "token_refresh_margin_hours": config.token_refresh_margin_hours,
+            "keepalive_time": config.keepalive_time,
+            "credit_refresh_times": config.credit_refresh_times,
             "version": VERSION,
         }
         return {
@@ -1391,6 +1430,7 @@ exit /b %RC%
             started_at=app.state.started_at,
             transport=transport,
             checkin=checkin,
+            maintenance=maintenance,
         )
     )
 

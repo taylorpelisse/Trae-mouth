@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import builtins
 import datetime as dt
 import json
@@ -18,10 +17,10 @@ from .accounts.store import AccountStore, STATUS_ACTIVE
 from .admin import AdminStore
 from .api_keys import ApiKeyStore
 from . import checkin as checkin_service
+from . import maintenance as maintenance_service
 from .config import Config
 from .db import Database
 from .security import now_ts
-from .upstream import activity
 from .upstream.ide_chat import map_usage
 
 SESSION_COOKIE = "tm_session"
@@ -77,6 +76,7 @@ def create_admin_console_router(
     version: str,
     started_at: int,
     checkin: Any,
+    maintenance: Any,
     transport: Any = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/admin/api")
@@ -129,158 +129,35 @@ def create_admin_console_router(
             "allow_local_import": config.allow_local_import,
             "checkin_auto": config.checkin_auto,
             "checkin_auto_time": config.checkin_auto_time,
+            "account_stagger_seconds": config.account_stagger_seconds,
+            "account_jitter_seconds": config.account_jitter_seconds,
+            "token_refresh_time": config.token_refresh_time,
+            "token_refresh_margin_hours": config.token_refresh_margin_hours,
+            "keepalive_time": config.keepalive_time,
+            "credit_refresh_times": config.credit_refresh_times,
             "version": version,
         }
         return raw
 
-    async def credit_for(record: Any) -> dict[str, Any]:
-        secrets = accounts.get_secrets(record.id)
-        device = accounts.get_device(record.id)
-        result = await activity.credit_usage(
-            config, secrets.token, device, transport=transport
-        )
-        data = result.get("data") if isinstance(result.get("data"), dict) else {}
-        plan = ""
-        packs = data.get("user_entitlement_pack_list")
-        if isinstance(packs, list):
-            for pack in packs:
-                if not isinstance(pack, dict):
-                    continue
-                base = pack.get("entitlement_base_info") or {}
-                if base.get("product_type") != 0:
-                    continue
-                desc = str(pack.get("display_desc") or "").strip()
-                group = str(pack.get("group_name") or "").strip()
-                if desc and desc != "免费":
-                    plan = desc
-                    break
-                if group and group != "免费":
-                    plan = group
-                    break
-            if not plan:
-                for pack in packs:
-                    if not isinstance(pack, dict):
-                        continue
-                    desc = str(pack.get("display_desc") or "").strip()
-                    group = str(pack.get("group_name") or "").strip()
-                    if desc == "免费" or group == "免费":
-                        plan = "Free"
-                        break
-        balance = data.get("total_balance")
-        if not isinstance(balance, (int, float)):
-            balance = None
-            summary = data.get("balance_summary")
-            if isinstance(summary, list):
-                values = [
-                    item.get("total_balance")
-                    for item in summary
-                    if isinstance(item, dict)
-                    and isinstance(item.get("total_balance"), (int, float))
-                ]
-                if values:
-                    balance = float(sum(values))
-        usage = data.get("usage_summary") if isinstance(data, dict) else {}
-        consumed = usage.get("consumed_amount") if isinstance(usage, dict) else None
-        if not isinstance(consumed, (int, float)):
-            consumed = None
-        used_today = None
-        day = dt.date.today().isoformat()
-        if consumed is not None:
-            now = now_ts()
-            with db.tx() as conn:
-                row = conn.execute(
-                    "SELECT baseline, latest FROM credit_daily "
-                    "WHERE account_id = ? AND day = ?",
-                    (record.id, day),
-                ).fetchone()
-                if row is None:
-                    baseline = float(consumed)
-                    latest = float(consumed)
-                    conn.execute(
-                        "INSERT INTO credit_daily(account_id, day, baseline, latest, updated_at) "
-                        "VALUES(?,?,?,?,?)",
-                        (record.id, day, baseline, latest, now),
-                    )
-                else:
-                    baseline = float(row["baseline"])
-                    latest = float(consumed)
-                    conn.execute(
-                        "UPDATE credit_daily SET latest = ?, updated_at = ? "
-                        "WHERE account_id = ? AND day = ?",
-                        (latest, now, record.id, day),
-                    )
-            used_today = max(0.0, latest - baseline)
-        if isinstance(balance, (int, float)):
-            now = now_ts()
-            with db.read() as conn:
-                previous = conn.execute(
-                    "SELECT balance, updated_at FROM credit_balance "
-                    "WHERE account_id = ?",
-                    (record.id,),
-                ).fetchone()
-            if previous is None:
-                with db.tx() as conn:
-                    conn.execute(
-                        "INSERT INTO credit_balance(account_id, balance, updated_at) "
-                        "VALUES(?,?,?)",
-                        (record.id, float(balance), now),
-                    )
-            else:
-                increased = float(balance) - float(previous["balance"])
-                if increased > 0.01:
-                    with db.read() as conn:
-                        recorded = float(
-                            conn.execute(
-                                "SELECT COALESCE(SUM(amount), 0) FROM credit_events "
-                                "WHERE account_id = ? AND created_at >= ?",
-                                (record.id, int(previous["updated_at"])),
-                            ).fetchone()[0]
-                        )
-                    recharge = increased - recorded
-                    if recharge > 0.01:
-                        with db.tx() as conn:
-                            conn.execute(
-                                "INSERT INTO credit_events(account_id, amount, reason, created_at) "
-                                "VALUES(?,?,?,?)",
-                                (record.id, recharge, "recharge", now),
-                            )
-                with db.tx() as conn:
-                    conn.execute(
-                        "UPDATE credit_balance SET balance = ?, updated_at = ? "
-                        "WHERE account_id = ?",
-                        (float(balance), now, record.id),
-                    )
-        return {
-            "account_id": record.id,
-            "account_label": record.label or record.username or record.id,
-            "plan": plan or record.plan,
-            "balance": balance,
-            "used_today": used_today,
-            "ok": bool(result.get("ok")),
-            "message": result.get("message") or "",
-            "raw": data,
-        }
-
-    async def all_credits(refresh: bool = False) -> dict[str, Any]:
+    def all_credits(refresh: bool = False) -> dict[str, Any]:
+        """积分列表只读本地记录，不请求上游；带 refresh 时在后台错峰刷新一次。"""
+        started = maintenance.start_manual("credits") if refresh else False
         records = [row for row in accounts.list() if row.status == STATUS_ACTIVE]
-        values = await asyncio.gather(
-            *(credit_for(record) for record in records), return_exceptions=True
-        )
         items = []
-        for record, value in zip(records, values):
-            if isinstance(value, Exception):
-                items.append(
-                    {
-                        "account_id": record.id,
-                        "account_label": record.label or record.username or record.id,
-                        "balance": None,
-                        "used_today": None,
-                        "ok": False,
-                        "message": str(value)[:300],
-                    }
-                )
-            else:
-                items.append(value)
+        for record in records:
+            cached = maintenance_service.cached_credit(db, record.id)
+            items.append(
+                {
+                    "account_id": record.id,
+                    "account_label": record.label or record.username or record.id,
+                    "plan": record.plan or "",
+                    "balance": cached["balance"],
+                    "used_today": cached["used_today"],
+                    "updated_at": cached["updated_at"],
+                    "ok": True,
+                    "message": "",
+                }
+            )
         available = sum(
             item["balance"] for item in items if isinstance(item["balance"], (int, float))
         )
@@ -295,12 +172,15 @@ def create_admin_console_router(
             "available": round(available, 2) if available or items else None,
             "used_today": round(used_today, 2),
             "today_used": round(used_today, 2),
-            "updated_at": now_ts(),
+            "updated_at": max((item["updated_at"] for item in items), default=0)
+            or now_ts(),
+            "refreshing": started or maintenance.is_running("credits"),
+            "started": started,
             "accounts": [
                 {
                     "account_id": item["account_id"],
                     "account_label": item["account_label"],
-                    "plan": item.get("plan", ""),
+                    "plan": item["plan"],
                     "balance": item["balance"],
                     "used_today": item["used_today"],
                     "ok": item["ok"],
@@ -677,15 +557,16 @@ def create_admin_console_router(
             "version": version,
         }
 
+    # 这两个接口要启动后台任务，必须跑在事件循环里，所以是 async
     @router.get("/credits")
     async def credits(
         refresh: int = 0, _: str = Depends(current_admin)
     ) -> dict[str, Any]:
-        return await all_credits(bool(refresh))
+        return all_credits(bool(refresh))
 
     @router.post("/credits")
     async def refresh_credits(_: str = Depends(current_admin)) -> dict[str, Any]:
-        return await all_credits(True)
+        return all_credits(True)
 
     @router.get("/credits/history")
     def credit_history(
@@ -777,68 +658,18 @@ def create_admin_console_router(
 
     @router.post("/accounts/refresh-all")
     async def refresh_all(_: str = Depends(current_admin)) -> dict[str, Any]:
-        results = []
-        for record in accounts.list():
-            if record.status != STATUS_ACTIVE:
-                continue
-            token_ok = True
-            message = ""
-            if record.has_refresh_token:
-                refreshed = refresher.refresh(record.id, force=True)
-                token_ok = bool(refreshed.ok)
-                message = refreshed.message
-            profile_ok = False
-            try:
-                secrets = accounts.get_secrets(record.id)
-                profile = await activity.user_info(
-                    config, secrets.token, transport=transport
-                )
-                data = profile.get("data") if isinstance(profile.get("data"), dict) else {}
-                name = ""
-                for key in ("ScreenName", "screenName", "NickName", "nickName", "Name"):
-                    value = data.get(key)
-                    if isinstance(value, str) and value.strip():
-                        name = value.strip()
-                        break
-                if profile.get("ok") and name:
-                    accounts.update_profile(record.id, username=name)
-                    profile_ok = True
-                elif profile.get("ok"):
-                    profile_ok = True
-                else:
-                    message = message or str(profile.get("message") or "")
-            except Exception as exc:
-                message = message or str(exc)[:300]
-            credit_ok = False
-            try:
-                credit = await credit_for(record)
-                credit_ok = bool(credit.get("ok"))
-                plan = str(credit.get("plan") or "")
-                if plan and plan != record.plan:
-                    accounts.update_profile(record.id, plan=plan)
-                if not credit_ok:
-                    message = message or str(credit.get("message") or "")
-            except Exception as exc:
-                message = message or str(exc)[:300]
-            results.append(
-                {
-                    "account_id": record.id,
-                    "account_label": record.label or record.username,
-                    "ok": token_ok and profile_ok and credit_ok,
-                    "token": token_ok,
-                    "profile": profile_ok,
-                    "credits": credit_ok,
-                    "message": message,
-                }
-            )
-        refreshed = sum(1 for item in results if item["ok"])
+        # 在后台逐个刷新令牌、资料和积分，账号之间按设置的间隔错峰
+        started = maintenance.start_manual("sync")
         return {
-            "ok": refreshed == len(results),
-            "success": refreshed == len(results),
-            "refreshed": refreshed,
-            "total": len(results),
-            "results": results,
+            "ok": True,
+            "success": True,
+            "started": started,
+            "running": True,
         }
+
+    @router.get("/maintenance")
+    def maintenance_status(_: str = Depends(current_admin)) -> dict[str, Any]:
+        return maintenance.status()
 
     @router.patch("/settings")
     def patch_settings(
@@ -869,6 +700,12 @@ def create_admin_console_router(
             "web_api_base",
             "checkin_auto",
             "checkin_auto_time",
+            "account_stagger_seconds",
+            "account_jitter_seconds",
+            "token_refresh_time",
+            "token_refresh_margin_hours",
+            "keepalive_time",
+            "credit_refresh_times",
         }
         unknown = [key for key in values if key not in allowed]
         if unknown:
@@ -944,6 +781,38 @@ def create_admin_console_router(
                     )
                 config.checkin_auto_time = text
                 values[key] = text
+            elif key in {"account_stagger_seconds", "account_jitter_seconds"}:
+                upper = 600 if key == "account_stagger_seconds" else 3600
+                setattr(config, key, max(0, min(upper, int(value))))
+                values[key] = getattr(config, key)
+            elif key == "token_refresh_margin_hours":
+                hours = int(value)
+                if not 1 <= hours <= 24 * 14:
+                    raise HTTPException(
+                        status_code=400, detail="令牌刷新提前量需在 1 到 336 小时之间"
+                    )
+                config.token_refresh_margin_hours = hours
+                config.refresh_window = hours * 3600
+                refresher.refresh_window = config.refresh_window
+                values[key] = hours
+            elif key in {"token_refresh_time", "keepalive_time"}:
+                # 留空表示关闭对应的定时任务
+                text = "" if value in (None, "") else checkin_service.normalize_time(value)
+                if value not in (None, "") and not text:
+                    raise HTTPException(
+                        status_code=400, detail="时刻需写成 HH:MM，留空表示关闭"
+                    )
+                setattr(config, key, text)
+                values[key] = text
+            elif key == "credit_refresh_times":
+                slots = maintenance_service.normalize_times(value)
+                if value not in (None, "") and not slots:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="积分刷新时刻需写成 HH:MM，多个用逗号隔开",
+                    )
+                config.credit_refresh_times = ",".join(slots)
+                values[key] = config.credit_refresh_times
             changed.append(key)
         persist_map = {
             "account_max_concurrency": "default_concurrency",
@@ -970,6 +839,12 @@ def create_admin_console_router(
             "web_api_base",
             "checkin_auto",
             "checkin_auto_time",
+            "account_stagger_seconds",
+            "account_jitter_seconds",
+            "token_refresh_time",
+            "token_refresh_margin_hours",
+            "keepalive_time",
+            "credit_refresh_times",
         }
         for key in changed:
             target = persist_map.get(key, key)

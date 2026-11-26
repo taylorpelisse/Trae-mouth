@@ -200,10 +200,11 @@ export function AccountsPage() {
     });
   }, [accounts, search, statusFilter]);
 
+  // 两个批量刷新都在后台按错峰间隔进行，这里只提示已开始，列表会定时自动刷新
   const refreshCredits = useMutation({
     mutationFn: () => apiPost("/credits?refresh=1"),
     onSuccess: () => {
-      toast.success("积分已刷新");
+      toast.success("已开始刷新积分，按错峰间隔在后台进行，稍后自动更新");
       queryClient.invalidateQueries({ queryKey: ["admin", "credits"] });
     },
     onError: (error: Error) => toast.error(error.message),
@@ -211,7 +212,7 @@ export function AccountsPage() {
   const refreshAll = useMutation({
     mutationFn: () => apiPost("/accounts/refresh-all"),
     onSuccess: () => {
-      toast.success("刷新完成");
+      toast.success("已开始刷新令牌、资料和积分，按错峰间隔在后台进行");
       queryClient.invalidateQueries({ queryKey: ["admin", "accounts"] });
     },
     onError: (error: Error) => toast.error(error.message),

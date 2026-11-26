@@ -371,7 +371,8 @@ class AccountStore:
     ) -> None:
         now = now_ts()
         with self.db.tx() as conn:
-            self._write_secrets(conn, account_id, tokens, now)
+            # 刷新器自己换到的令牌不改变「令牌是否绑定到本设备」这个事实
+            self._write_secrets(conn, account_id, tokens, now, refreshed=True)
             fields = ["last_refreshed_at = ?", "updated_at = ?"]
             values: list[Any] = [now, now]
             if username:
@@ -474,6 +475,13 @@ class AccountStore:
             if not row:
                 return
             conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+            # 刷新接口选择、重试时间、签到设备号代数与冷却时间都按账号存在设置表里
+            suffix = ":" + account_id
+            for prefix in ("refresh", "checkin"):
+                conn.execute(
+                    "DELETE FROM settings WHERE key LIKE ? AND substr(key, -?) = ?",
+                    (f"{prefix}:%", len(suffix), suffix),
+                )
             self._log(conn, None, "account_deleted", f"{account_id}:{row['user_id']} {actor}")
 
     def log_event(self, account_id: Optional[str], event: str, detail: str = "") -> None:
@@ -487,7 +495,15 @@ class AccountStore:
         account_id: str,
         tokens: TokenBundle,
         now: int,
+        *,
+        refreshed: bool = False,
     ) -> None:
+        if not refreshed:
+            # 令牌来自登录或导入：它与设备的关系可能变了，清掉刷新器留下的记录
+            conn.execute(
+                "DELETE FROM settings WHERE key LIKE 'refresh:%' AND substr(key, -?) = ?",
+                (len(":" + account_id), ":" + account_id),
+            )
         conn.execute(
             """
             INSERT INTO account_secrets(
