@@ -59,8 +59,9 @@ def prepare(app, client, *, max_output: int = 64000) -> str:
         token_expires_at=int(time.time()) + 86400,
         device=build_device(),
     )
+    # 目录是全局快照，播种一次所有账号都能用
     app.state.catalog_cache.put(
-        record.id,
+        "ide",
         {
             "groups": {
                 "ide": {
@@ -433,9 +434,6 @@ def test_chat_account_header_selects_requested_account(config) -> None:
             token_expires_at=int(time.time()) + 86400,
             device=build_device(),
         )
-        app.state.catalog_cache.put(
-            second.id, dict(app.state.catalog_cache.get(first_id) or {})
-        )
         response = client.post(
             "/v1/chat/completions",
             headers={**auth(config), "X-Account-Id": second.id},
@@ -658,6 +656,145 @@ def test_translator_emits_tool_call_before_finalize() -> None:
     assert not any('"tool_calls": [{' in chunk for chunk in final)
 
 
+def test_stream_multiple_tool_calls_in_one_turn() -> None:
+    """一轮两个调用、且标记被拆到多个事件里，都要按两个 index 发出去。"""
+    translator = OpenAIStreamTranslator("test-model", tools_expected=True)
+    translator.feed(
+        {
+            "event": "output",
+            "data": {"response": "<tool_call><function=read_file><parameter=path>a.t"},
+        }
+    )
+    translator.feed(
+        {
+            "event": "output",
+            "data": {
+                "response": (
+                    "xt</parameter></function>"
+                    "<function=read_file><parameter=path>b.txt</parameter></function>"
+                )
+            },
+        }
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    chunks = translator.finalize()
+    emitted = []
+    for chunk in chunks:
+        text = chunk[len("data: ") :].strip() if chunk.startswith("data: ") else chunk
+        try:
+            delta = json.loads(text)["choices"][0]["delta"]
+        except (ValueError, KeyError, IndexError):
+            continue
+        emitted.extend(delta.get("tool_calls") or [])
+    calls = translator.message()["tool_calls"]
+    assert [call["function"]["name"] for call in calls] == ["read_file", "read_file"]
+    assert [json.loads(call["function"]["arguments"]) for call in calls] == [
+        {"path": "a.txt"},
+        {"path": "b.txt"},
+    ]
+    assert len({call["id"] for call in calls}) == 2
+    assert len(emitted) == 2
+    assert sorted(item["index"] for item in emitted) == [0, 1]
+
+
+def test_stream_unparseable_call_attempt_does_not_leak_markup() -> None:
+    """写到一半的调用标记不能当正文漏给用户。"""
+    translator = OpenAIStreamTranslator("test-model", tools_expected=True)
+    translator.feed(
+        {
+            "event": "output",
+            "data": {
+                "response": (
+                    "<tool_call><function=read_file><parameter=path>a.txt"
+                    "</parameter><parameter=content>hel"
+                )
+            },
+        }
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    with pytest.raises(UpstreamError):
+        translator.finalize()
+
+
+def test_stream_truncated_call_keeps_prose_only() -> None:
+    """有正文时只丢标记，正文照常输出。"""
+    translator = OpenAIStreamTranslator("test-model", tools_expected=True)
+    chunks = translator.feed(
+        {
+            "event": "output",
+            "data": {
+                "response": (
+                    "好的，我来读。\n"
+                    "<tool_call><function=read_file><parameter=path>a.txt"
+                    "</parameter><parameter=content>hel"
+                )
+            },
+        }
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    chunks.extend(translator.finalize())
+    body = "".join(chunks)
+    assert "好的，我来读。" in body
+    assert "<tool_call" not in body
+    assert "<parameter" not in body
+    assert not translator.message().get("tool_calls")
+
+
+def test_undeclared_tool_names_are_dropped() -> None:
+    """模型编造的工具名不能下发给客户端。"""
+    schema = {"type": "object", "properties": {"path": {"type": "string"}}}
+    translator = OpenAIStreamTranslator(
+        "test-model", tools_expected=True, tool_schemas={"read_file": schema}
+    )
+    translator.feed(
+        {
+            "event": "output",
+            "data": {"response": '<tool_call>{"name":"tool_name","arguments":{}}</tool_call>'},
+        }
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    with pytest.raises(UpstreamError) as info:
+        translator.finalize()
+    assert "neither text nor a tool call" in str(info.value)
+
+
+def test_parallel_wrapper_expands_to_declared_calls() -> None:
+    """multi_tool_use.parallel 拆成真实调用。"""
+    schema = {"type": "object", "properties": {"path": {"type": "string"}}}
+    translator = OpenAIStreamTranslator(
+        "test-model", tools_expected=True, tool_schemas={"read_file": schema}
+    )
+    wrapper = {
+        "name": "multi_tool_use.parallel",
+        "arguments": {
+            "tool_uses": [
+                {
+                    "recipient_name": "functions.read_file",
+                    "parameters": {"path": "a.txt"},
+                },
+                {
+                    "recipient_name": "functions.read_file",
+                    "parameters": {"path": "b.txt"},
+                },
+            ]
+        },
+    }
+    translator.feed(
+        {
+            "event": "output",
+            "data": {"response": "<tool_call>" + json.dumps(wrapper) + "</tool_call>"},
+        }
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    translator.finalize()
+    calls = translator.message()["tool_calls"]
+    assert [call["function"]["name"] for call in calls] == ["read_file", "read_file"]
+    assert [json.loads(call["function"]["arguments"]) for call in calls] == [
+        {"path": "a.txt"},
+        {"path": "b.txt"},
+    ]
+
+
 def test_chat_failover_and_affinity(config) -> None:
     config.api_key = "test-key"
     content = sse(
@@ -690,9 +827,6 @@ def test_chat_failover_and_affinity(config) -> None:
             refresh_token="refresh-2",
             token_expires_at=int(time.time()) + 86400,
             device=build_device(),
-        )
-        app.state.catalog_cache.put(
-            second.id, dict(app.state.catalog_cache.get(first_id) or {})
         )
         payload = {
             "model": "test-model",
@@ -783,9 +917,6 @@ def test_chat_stops_after_repeated_upstream_error(config) -> None:
                 token_expires_at=int(time.time()) + 86400,
                 device=build_device(),
             )
-            app.state.catalog_cache.put(
-                record.id, dict(app.state.catalog_cache.get(first_id) or {})
-            )
             extra_ids.append(record.id)
         response = client.post(
             "/v1/chat/completions",
@@ -832,9 +963,6 @@ def test_chat_empty_response_retries_without_cooldown(config) -> None:
             refresh_token="refresh-2",
             token_expires_at=int(time.time()) + 86400,
             device=build_device(),
-        )
-        app.state.catalog_cache.put(
-            second.id, dict(app.state.catalog_cache.get(first_id) or {})
         )
         response = client.post(
             "/v1/chat/completions",
@@ -1102,9 +1230,6 @@ def test_chat_bad_model_output_retries_without_cooldown(config) -> None:
             token_expires_at=int(time.time()) + 86400,
             device=build_device(),
         )
-        app.state.catalog_cache.put(
-            second.id, dict(app.state.catalog_cache.get(first_id) or {})
-        )
         response = client.post(
             "/v1/chat/completions",
             headers=auth(config),
@@ -1212,9 +1337,6 @@ def test_chat_request_level_upstream_error_does_not_cool_accounts(config) -> Non
                 refresh_token=f"refresh-{index}",
                 token_expires_at=int(time.time()) + 86400,
                 device=build_device(),
-            )
-            app.state.catalog_cache.put(
-                record.id, dict(app.state.catalog_cache.get(account_ids[0]) or {})
             )
             account_ids.append(record.id)
         response = client.post(

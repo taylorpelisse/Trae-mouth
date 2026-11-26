@@ -205,6 +205,13 @@ CREATE TABLE IF NOT EXISTS credit_balance (
     balance REAL NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS model_catalog_snapshot (
+    scope TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    account_id TEXT NOT NULL DEFAULT ''
+);
 """
 
 DEVICE_COLUMNS = {

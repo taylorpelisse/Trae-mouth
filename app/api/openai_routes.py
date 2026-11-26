@@ -346,6 +346,63 @@ class OpenAIStreamTranslator:
         self.calls.append(call)
         return call
 
+    def _expand_calls(
+        self, name: str, arguments: Any
+    ) -> list[tuple[str, Any]]:
+        """把模型自造的调用映射回客户端真正声明过的工具。
+
+        模型会凭训练记忆编出 ``tool_name``、``multi_tool_use.parallel`` 这类
+        本请求里根本没声明的工具；原样下发只会让客户端报“未知工具”。这里把
+        常见的并行包装拆成内部调用，其余未声明的名字一律丢弃。
+        """
+
+        if not self.tool_schemas:
+            return [(name, arguments)]
+        if name in self.tool_schemas:
+            return [(name, arguments)]
+        lowered = name.lower()
+        if lowered in {"multi_tool_use.parallel", "multi_tool_use", "parallel"}:
+            uses = arguments.get("tool_uses") if isinstance(arguments, Mapping) else None
+            if isinstance(uses, str):
+                try:
+                    uses = json.loads(uses)
+                except ValueError:
+                    uses = None
+            expanded: list[tuple[str, Any]] = []
+            if isinstance(uses, list):
+                for item in uses:
+                    if not isinstance(item, Mapping):
+                        continue
+                    recipient = str(
+                        item.get("recipient_name")
+                        or item.get("name")
+                        or item.get("tool_name")
+                        or ""
+                    )
+                    recipient = recipient.rsplit(".", 1)[-1]
+                    if recipient not in self.tool_schemas:
+                        continue
+                    params = item.get("parameters")
+                    if params is None:
+                        params = item.get("arguments")
+                    expanded.append((recipient, params if params is not None else {}))
+            if expanded:
+                return expanded
+        matches = [key for key in self.tool_schemas if key.lower() == lowered]
+        if len(matches) == 1:
+            return [(matches[0], arguments)]
+        return []
+
+    def _add_expanded(
+        self, name: str, arguments: Any, call_id: str = ""
+    ) -> list[dict[str, Any]]:
+        added: list[dict[str, Any]] = []
+        for item_name, item_args in self._expand_calls(name, arguments):
+            call = self._add_call(item_name, item_args, call_id)
+            if call is not None:
+                added.append(call)
+        return added
+
     def _native_calls(self, data: Mapping[str, Any]) -> None:
         raw = data.get("tool_calls")
         if not isinstance(raw, list):
@@ -374,7 +431,7 @@ class OpenAIStreamTranslator:
             call_id = str(
                 item.get("id") or item.get("tool_call_id") or item.get("toolCallId") or ""
             )
-            self._add_call(name, arguments, call_id)
+            self._add_expanded(name, arguments, call_id)
 
     def _emit_visible(self, chunks: list[str]) -> None:
         new_calls: list[dict[str, Any]]
@@ -396,30 +453,28 @@ class OpenAIStreamTranslator:
             self.emitted_content = True
             chunks.append(self._chunk({"content": delta}))
         for call in new_calls:
-            added = self._add_call(
+            for added in self._add_expanded(
                 str(call.get("name") or ""), call.get("arguments") or {}
-            )
-            if added is None:
-                continue
-            index = len(self.calls) - 1
-            if index in self._emitted_call_indexes:
-                continue
-            self._start(chunks)
-            self._emitted_call_indexes.add(index)
-            chunks.append(
-                self._chunk(
-                    {
-                        "tool_calls": [
-                            {
-                                "index": index,
-                                "id": added["id"],
-                                "type": "function",
-                                "function": added["function"],
-                            }
-                        ]
-                    }
+            ):
+                index = self.calls.index(added)
+                if index in self._emitted_call_indexes:
+                    continue
+                self._start(chunks)
+                self._emitted_call_indexes.add(index)
+                chunks.append(
+                    self._chunk(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": index,
+                                    "id": added["id"],
+                                    "type": "function",
+                                    "function": added["function"],
+                                }
+                            ]
+                        }
+                    )
                 )
-            )
 
     def feed(self, event: Mapping[str, Any]) -> list[str]:
         chunks: list[str] = []
@@ -562,9 +617,17 @@ class OpenAIStreamTranslator:
         native = self.filter.native_incomplete
         if native:
             salvaged = ide_chat._parse_json_tool_calls(native)
+            if not salvaged:
+                salvaged = ide_chat._salvage_native_xml(native)
             if salvaged:
                 new_calls.extend(salvaged)
-            elif self.filter.native_truncated or "{" in native:
+            elif (
+                self.filter.native_truncated
+                or "{" in native
+                or ide_chat._looks_like_call_attempt(native)
+            ):
+                # 认得出是调用标记（哪怕只写了一半）就不能当正文漏给用户：
+                # 优先丢弃并按截断处理，客户端至少能重试。
                 self.dropped_truncated_call = True
                 logger.warning(
                     "dropped truncated native tool call payload (%d chars)",
@@ -584,12 +647,22 @@ class OpenAIStreamTranslator:
             delta = visible[common:]
         self.visible = visible
         for call in new_calls:
-            self._add_call(str(call.get("name") or ""), call.get("arguments") or {})
+            self._add_expanded(
+                str(call.get("name") or ""), call.get("arguments") or {}
+            )
         return delta
 
     def finalize(self) -> list[str]:
         chunks: list[str] = []
         delta = self._finalize_calls()
+        if self.tools_expected:
+            # 统计模型实际用了哪种调用写法，方便判断哪些兼容分支还有用。
+            logger.info(
+                "tool format model=%s fmt=%s calls=%d",
+                self.model,
+                ide_chat.detect_tool_format(self.response.text),
+                len(self.calls),
+            )
         if delta:
             self._start(chunks)
             self.emitted_content = True
@@ -821,10 +894,8 @@ def create_openai_router(
     refresher: Any,
     transport: Any,
     ensure_device: Callable[[Any, str, Any], Any],
+    # 目录是全局快照，只读；刷新由 maintenance 的每日轮询任务负责
     model_catalog_for: Callable[..., Optional[dict[str, Any]]],
-    # 过期或缺失的目录交给它在后台错峰刷新；列模型本身只读缓存
-    warm_catalogs: Callable[[], None] = lambda: None,
-    catalog_fresh: Callable[[str], bool] = lambda account_id: False,
     account_router: Optional[AccountRouter] = None,
     async_client: Optional[httpx.AsyncClient] = None,
 ) -> APIRouter:
@@ -910,13 +981,8 @@ def create_openai_router(
         prefer_max: bool,
         channel: str = "",
     ):
+        # 目录是全局快照，只读不拉：刷新统一交给每天一次的轮询任务。
         catalog = model_catalog_for(account_id, False)
-        resolved = ide_chat.resolve_model(
-            catalog, model, prefer_max=prefer_max, channel=channel
-        )
-        if resolved:
-            return catalog, resolved
-        catalog = model_catalog_for(account_id, True)
         resolved = ide_chat.resolve_model(
             catalog, model, prefer_max=prefer_max, channel=channel
         )
@@ -992,25 +1058,20 @@ def create_openai_router(
                     for model_id in model_ids:
                         models.setdefault(model_id, (model, not web))
 
-        # 没有缓存或已过期的账号：照常用手头的目录，刷新交给错峰的后台任务
-        cold: list[str] = []
-        for record in records:
-            try:
-                catalog = model_catalog_for(record.id, False, background=False)
-            except Exception:
-                continue
-            if not isinstance(catalog, dict) or not catalog_fresh(record.id):
-                cold.append(record.id)
-            if isinstance(catalog, dict):
-                absorb(catalog)
-        if not models and records:
-            # 一份缓存都没有（通常是刚启动）：同步取一个账号，保证列表不为空
+        # 目录是全局快照，与账号无关；这里只读，不触发刷新
+        catalog: Any = None
+        try:
+            catalog = model_catalog_for("", False)
+        except Exception:
+            catalog = None
+        if isinstance(catalog, dict):
+            absorb(catalog)
+        else:
+            # 一份快照都没有（通常是刚部署）：同步拉一次，保证列表不为空
             try:
                 absorb(model_catalog_for(records[0].id, True))
             except Exception:
                 pass
-        if cold:
-            warm_catalogs()
         data = [
             model_catalog.to_openai_model(
                 model,

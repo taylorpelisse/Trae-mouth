@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import httpx
 
@@ -175,24 +176,25 @@ def test_fetch_catalog_groups_and_capabilities(config) -> None:
 
 def test_catalog_cache() -> None:
     cache = CatalogCache(ttl=60)
-    assert cache.get("a") is None
-    cache.put("a", {"ok": True})
-    assert cache.get("a") == {"ok": True}
-    assert cache.get("a", force=True) is None
-    cache.invalidate("a")
-    assert cache.get("a") is None
+    assert cache.get("ide") is None
+    cache.put("ide", {"ok": True})
+    assert cache.get("ide") == {"ok": True}
+    cache.invalidate()
+    assert cache.get("ide") is None
 
 
-def test_catalog_cache_keeps_stale_value() -> None:
-    cache = CatalogCache(ttl=10)
-    cache.put("a", {"ok": True})
-    cache._data["a"] = (0, {"ok": True}, 1.0)
-    assert cache.get("a") is None
-    assert cache.get_stale("a") == {"ok": True}
-    assert cache.begin_refresh("a") is True
-    assert cache.begin_refresh("a") is False
-    cache.end_refresh("a")
-    assert cache.begin_refresh("a") is True
+def test_catalog_cache_persists_across_instances(tmp_path) -> None:
+    """快照落在 SQLite 里，重启后不用重拉。"""
+    from app.db import Database
+
+    db = Database(tmp_path / "cache.db")
+    db.migrate()
+    cache = CatalogCache(db, ttl=60)
+    cache.put("ide", {"groups": {"ide": {"model_count": 2}}, "fetched_at": 123}, "acct")
+    again = CatalogCache(db, ttl=60)
+    assert again.get("ide")["groups"]["ide"]["model_count"] == 2
+    assert again.fetched_at("ide") == 123
+    assert again.account_id("ide") == "acct"
 
 
 def _single_rows(function: str) -> list[dict]:
@@ -271,23 +273,30 @@ def test_fetch_catalog_can_skip_web(config) -> None:
     assert seen == [model_catalog.IDE_BATCH_PATH]
 
 
-def test_catalog_cache_jitter_and_web_freshness() -> None:
+def test_catalog_cache_scopes_have_separate_ttl() -> None:
+    """IDE 快照按天过期，Web 快照按周过期。"""
+    cache = CatalogCache(ttl=100, web_ttl=1000)
+    assert not cache.fresh(model_catalog.IDE_SCOPE)
+    cache.put(model_catalog.IDE_SCOPE, {"ok": True})
+    assert cache.fresh(model_catalog.IDE_SCOPE)
+    # 刚写入的 IDE 快照不能算 Web 快照
+    assert not cache.fresh(model_catalog.WEB_SCOPE)
+
+    cache.put(model_catalog.WEB_SCOPE, {"ok": True})
+    assert cache.fresh(model_catalog.WEB_SCOPE)
+    # 把写入时间推早到 IDE 已过期、Web 未过期
+    cache._data[model_catalog.IDE_SCOPE] = (int(time.time()) - 500, {"ok": True}, "")
+    cache._data[model_catalog.WEB_SCOPE] = (int(time.time()) - 500, {"ok": True}, "")
+    assert not cache.fresh(model_catalog.IDE_SCOPE)
+    assert cache.fresh(model_catalog.WEB_SCOPE)
+
+
+def test_catalog_cache_refresh_guard() -> None:
     cache = CatalogCache(ttl=100)
-    cache.put("a", {"ok": True}, full=False)
-    assert not cache.web_fresh("a", 1000)
-    cache.put("a", {"ok": True})
-    assert cache.web_fresh("a", 1000)
-
-    # 每个账号的有效期在设定值上下 20% 内浮动
-    factors = set()
-    for index in range(60):
-        cache.put(f"k{index}", {"ok": True})
-        factors.add(cache._data[f"k{index}"][2])
-    assert all(0.8 <= factor <= 1.2 for factor in factors)
-    assert len(factors) > 1
-
-    cache.invalidate("a")
-    assert not cache.web_fresh("a", 1000) and cache.get("a") is None
+    assert cache.begin_refresh() is True
+    assert cache.begin_refresh() is False
+    cache.end_refresh()
+    assert cache.begin_refresh() is True
 
 
 def test_openai_effort_uses_openai_vocabulary() -> None:

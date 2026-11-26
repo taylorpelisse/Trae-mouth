@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from app import maintenance as maintenance_module
 from app.accounts.models import build_device
 from app.main import create_app
+from app.upstream import model_catalog
 from tests.conftest import make_jwt
 from tests.test_api import setup_admin
 
@@ -455,45 +456,47 @@ def wait_job(app, job: str) -> dict:
     raise AssertionError(f"maintenance job {job} did not finish")
 
 
-def test_model_listing_reads_cache_and_refreshes_expired_in_background(config, env) -> None:
-    stale_id = env.add("user-1")
-    fresh_id = env.add("user-2")
+def test_model_listing_reads_snapshot_without_requesting_upstream(config, env) -> None:
+    """目录是全局快照：列模型只读，不因为过期就去拉。"""
+    env.add("user-1")
+    env.add("user-2")
     config.global_ide = True
     config.api_key = "test-key"
     cache = env.app.state.catalog_cache
-    cache.put(stale_id, cached_catalog("stale-model"), full=False)
-    cache.put(fresh_id, cached_catalog("fresh-model"), full=False)
-    cache._data[stale_id] = (0, cache.get_stale(stale_id), 1.0)
+    cache.put(model_catalog.IDE_SCOPE, cached_catalog("stale-model"))
+    # 把快照时间推到过期之后
+    cache._data[model_catalog.IDE_SCOPE] = (
+        int(time.time()) - 100000,
+        cache.get(model_catalog.IDE_SCOPE),
+        "user-1",
+    )
     headers = {"Authorization": "Bearer test-key"}
 
     with env.client:
         listed = env.client.get("/v1/models", headers=headers).json()
-        # 过期的目录照常返回，列模型本身不请求上游
-        assert sorted(item["id"] for item in listed["data"]) == ["fresh-model", "stale-model"]
+        # 过期的快照照常返回，列模型本身不请求上游
+        assert [item["id"] for item in listed["data"]] == ["stale-model"]
         assert env.upstream.paths(CATALOG_BATCH) == []
 
-        # 过期的那个账号交给后台刷新，仍在有效期内的不动
-        items = wait_job(env.app, "catalogs")["jobs"]["catalogs"]["last"]["items"]
-        assert {item["account_id"]: item["status"] for item in items} == {
-            stale_id: "ok",
-            fresh_id: "skipped",
-        }
-        assert len(env.upstream.paths(CATALOG_BATCH)) == 1
-        # 过期的那个账号第一次拉目录时带上 Web 部分
-        assert len(env.upstream.paths("/api/remote/v1/models")) == 3
-
-        # 后台的「刷新」按钮：立即返回，全部账号在后台重新拉取
+        # 手动刷新才拉，而且只用一个账号
         admin = setup_admin(env.client)
         refreshed = env.client.get("/admin/api/models?refresh=1", headers=admin).json()
         assert refreshed["models"]
         wait_job(env.app, "catalogs")
-        assert len(env.upstream.paths(CATALOG_BATCH)) == 3
-        # 另一个账号也是第一次拉 Web 目录；之后 24 小时内不再拉
-        assert len(env.upstream.paths("/api/remote/v1/models")) == 6
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 1
+        # 第一次拉目录时顺带取 Web 部分（3 个请求）
+        assert len(env.upstream.paths("/api/remote/v1/models")) == 3
+
+        # 定时刷新（非强制）：IDE 与 Web 都还在有效期内，一个请求都不发
+        run(env.app.state.maintenance.run("catalogs", "auto"))
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 1
+        assert len(env.upstream.paths("/api/remote/v1/models")) == 3
+
+        # 手动刷新是强制的：连 Web 一起重拉
         env.client.get("/admin/api/models?refresh=1", headers=admin)
         time.sleep(0.2)
         wait_job(env.app, "catalogs")
-        assert len(env.upstream.paths(CATALOG_BATCH)) == 5
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 2
         assert len(env.upstream.paths("/api/remote/v1/models")) == 6
 
 
@@ -504,20 +507,36 @@ def test_model_listing_fetches_one_account_when_nothing_is_cached(config, env) -
 
     with env.client:
         listed = env.client.get("/v1/models", headers={"Authorization": "Bearer test-key"}).json()
-        # 刚启动一份缓存都没有：同步取一个账号保证列表不为空
+        # 一份快照都没有：同步用一个账号拉一次，保证列表不为空
         assert [item["id"] for item in listed["data"]]
         assert len(env.upstream.paths(CATALOG_BATCH)) == 1
-        # 其余账号在后台错峰补齐
-        wait_job(env.app, "catalogs")
-        assert len(env.upstream.paths(CATALOG_BATCH)) == 3
+        # 不会再为其他账号补拉：目录是全局的
+        time.sleep(0.2)
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 1
 
 
-def test_previous_web_catalog_is_carried_over() -> None:
-    from app.main import _carry_web_catalog
+def test_merge_snapshots_combines_ide_and_web() -> None:
+    from app.main import _merge_snapshots
 
-    previous = {
+    ide = {
         "groups": {
-            "remote": {"label": "Remote", "models": [{"config_name": "web-only"}], "model_count": 1},
+            "ide": {
+                "models": [
+                    {
+                        "config_name": "glm",
+                        "reasoning": {"supported": True, "levels": ["high"], "default": "high"},
+                    },
+                    {"config_name": "other", "reasoning": {"supported": True, "levels": [], "default": ""}},
+                ],
+                "model_count": 2,
+            }
+        },
+        "errors": {"ide": "warn"},
+        "fetched_at": 100,
+    }
+    web = {
+        "groups": {
+            "remote": {"models": [{"config_name": "web-only"}], "model_count": 1},
             "ide": {
                 "models": [
                     {
@@ -527,33 +546,30 @@ def test_previous_web_catalog_is_carried_over() -> None:
                 ],
                 "model_count": 1,
             },
-        }
-    }
-    result = {
-        "groups": {
-            "ide": {
-                "models": [
-                    {"config_name": "glm", "reasoning": {"supported": True, "levels": [], "default": ""}},
-                    {"config_name": "other", "reasoning": {"supported": True, "levels": [], "default": ""}},
-                ],
-                "model_count": 2,
-            }
         },
-        "model_count": 2,
+        "errors": {},
+        "fetched_at": 50,
     }
 
-    # 这次没拉 Web 目录：Web 通道沿用上次，IDE 条目缺的推理档位从上次补上
-    _carry_web_catalog(result, previous)
-
-    assert result["groups"]["remote"] is previous["groups"]["remote"]
-    reasoning = {model["config_name"]: model["reasoning"] for model in result["groups"]["ide"]["models"]}
+    merged = _merge_snapshots(ide, web)
+    # Web 分组被带上，IDE 分组以 IDE 快照为准
+    assert merged["groups"]["remote"] is web["groups"]["remote"]
+    assert merged["groups"]["ide"] is ide["groups"]["ide"]
+    # IDE 缺的推理档位从 Web 快照补上，没匹配到的不动
+    reasoning = {
+        model["config_name"]: model["reasoning"]
+        for model in merged["groups"]["ide"]["models"]
+    }
     assert reasoning["glm"]["levels"] == ["light", "high"]
     assert reasoning["other"]["levels"] == []
-    assert result["model_count"] == 3
-    # 没有上次的目录时什么都不做
-    untouched = {"groups": {"ide": {"models": [], "model_count": 0}}, "model_count": 0}
-    _carry_web_catalog(untouched, None)
-    assert untouched == {"groups": {"ide": {"models": [], "model_count": 0}}, "model_count": 0}
+    assert merged["model_count"] == 3
+    assert merged["fetched_at"] == 100
+    assert merged["errors"] == {"ide": "warn"}
+
+    # 只有一边有快照时直接用那一边
+    assert _merge_snapshots(None, web)["model_count"] == 2
+    assert _merge_snapshots(ide, None)["model_count"] == 2
+    assert _merge_snapshots(None, None) is None
 
 
 def test_admin_models_page_loads_missing_catalogs_in_background(config, env) -> None:
@@ -571,8 +587,10 @@ def test_admin_models_page_loads_missing_catalogs_in_background(config, env) -> 
         assert second["loading"] is False
         # 全局 IDE 开启时后台只展示 IDE 通道的模型
         assert [model["id"] for model in second["models"]] == ["model-chat_v3"]
+        # 目录是全局的，所有活跃账号都能用
         assert second["models"][0]["account_count"] == 2
-        assert len(env.upstream.paths(CATALOG_BATCH)) == 2
+        # 只用一个账号拉
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 1
 
 
 def test_deleting_account_removes_its_remembered_state(config, env) -> None:

@@ -135,6 +135,7 @@ def create_admin_console_router(
             "token_refresh_margin_hours": config.token_refresh_margin_hours,
             "keepalive_time": config.keepalive_time,
             "credit_refresh_times": config.credit_refresh_times,
+            "catalog_refresh_time": config.catalog_refresh_time,
             "version": version,
         }
         return raw
@@ -355,14 +356,14 @@ def create_admin_console_router(
             # 刷新全部放到后台按错峰间隔进行；这里照常返回手头的目录
             maintenance.start_manual("catalogs", force=True)
         missing = False
-        for record in records:
-            try:
-                catalog = model_catalog_for(record.id, False, background=False)
-            except Exception:
-                continue
-            if not isinstance(catalog, dict):
-                missing = True
-                continue
+        try:
+            catalog = model_catalog_for("", False)
+        except Exception:
+            catalog = None
+        catalogs = [catalog] if isinstance(catalog, dict) else []
+        if not catalogs:
+            missing = True
+        for catalog in catalogs:
             groups = catalog.get("groups") or {}
             for channel, group in groups.items():
                 if not isinstance(group, dict):
@@ -438,14 +439,15 @@ def create_admin_console_router(
                     )
                     if channel in {"ide", "solo"}:
                         item["tools_supported"] = True
-                    item["_accounts"].add(record.id)
         models = []
         for item in merged.values():
-            item["account_count"] = len(item.pop("_accounts"))
+            item.pop("_accounts", None)
+            # 目录是全局快照，所有活跃账号都能用这些模型
+            item["account_count"] = len(records)
             models.append(item)
         models.sort(key=lambda item: item["id"].lower())
-        if missing:
-            # 有账号还没取过目录（通常是刚启动）：在后台按错峰间隔加载，页面会定时重新读取
+        if missing and records:
+            # 一份快照都没有（通常是刚部署）：后台用轮询到的账号拉一次
             maintenance.start_manual("catalogs")
         return {"models": models, "fetched_at": now_ts(), "loading": missing}
 
@@ -716,6 +718,7 @@ def create_admin_console_router(
             "token_refresh_margin_hours",
             "keepalive_time",
             "credit_refresh_times",
+            "catalog_refresh_time",
         }
         unknown = [key for key in values if key not in allowed]
         if unknown:
@@ -823,6 +826,14 @@ def create_admin_console_router(
                     )
                 config.credit_refresh_times = ",".join(slots)
                 values[key] = config.credit_refresh_times
+            elif key == "catalog_refresh_time":
+                text = "" if value in (None, "") else checkin_service.normalize_time(value)
+                if value not in (None, "") and not text:
+                    raise HTTPException(
+                        status_code=400, detail="时刻需写成 HH:MM，留空表示关闭"
+                    )
+                config.catalog_refresh_time = text
+                values[key] = text
             changed.append(key)
         persist_map = {
             "account_max_concurrency": "default_concurrency",
@@ -855,6 +866,7 @@ def create_admin_console_router(
             "token_refresh_margin_hours",
             "keepalive_time",
             "credit_refresh_times",
+            "catalog_refresh_time",
         }
         for key in changed:
             target = persist_map.get(key, key)

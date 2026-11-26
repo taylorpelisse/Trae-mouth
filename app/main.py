@@ -10,7 +10,7 @@ import threading
 import time
 import zipfile
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -62,7 +62,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.3.4"
+VERSION = "0.4.0"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"
@@ -352,6 +352,7 @@ PERSISTED_SETTING_KEYS = (
     "token_refresh_margin_hours",
     "keepalive_time",
     "credit_refresh_times",
+    "catalog_refresh_time",
 )
 
 
@@ -371,43 +372,66 @@ def _apply_persisted_settings(config: Config, db: Database) -> None:
     config.refresh_window = max(1, min(24 * 14, hours)) * 3600
 
 
-# Web 目录只给非 IDE 通道和推理档位提示用，最多这么久更新一次
-WEB_CATALOG_TTL = 24 * 3600
 WEB_CATALOG_GROUPS = ("remote", "work", "design")
 
 
-def _carry_web_catalog(
-    result: dict[str, Any], previous: Optional[dict[str, Any]]
-) -> None:
-    """这次没拉 Web 目录时，把上次的 Web 部分和推理档位提示接到新目录上。"""
-    if not previous:
-        return
-    groups = result.setdefault("groups", {})
-    old_groups = previous.get("groups") or {}
-    for key in WEB_CATALOG_GROUPS:
-        if isinstance(old_groups.get(key), dict):
-            groups[key] = old_groups[key]
+def _merge_snapshots(
+    ide: Optional[dict[str, Any]], web: Optional[dict[str, Any]]
+) -> Optional[dict[str, Any]]:
+    """把 IDE 与 Web 两份快照拼成一份目录。
+
+    IDE 快照是主体；Web 快照只补两件事：非 IDE 通道用的 remote/work/design 分组，
+    以及比 IDE 更完整的推理档位。
+    """
+    if not isinstance(ide, dict) and not isinstance(web, dict):
+        return None
+    base: dict[str, Any] = {
+        "groups": {},
+        "errors": {},
+        "fetched_at": 0,
+        "model_count": 0,
+    }
+    for source in (web, ide):
+        if not isinstance(source, dict):
+            continue
+        groups = base["groups"]
+        for key, group in (source.get("groups") or {}).items():
+            if isinstance(group, dict):
+                groups[key] = group
+        if isinstance(source.get("errors"), dict):
+            base["errors"].update(source["errors"])
+        base["fetched_at"] = max(
+            int(base["fetched_at"]), int(source.get("fetched_at") or 0)
+        )
+    web_groups = (web or {}).get("groups") or {}
+    web_models: dict[str, Mapping[str, Any]] = {}
     for key in ("ide", "solo"):
-        old_models = {
-            str(model.get("config_name") or ""): model
-            for model in (old_groups.get(key) or {}).get("models") or []
-            if isinstance(model, dict)
-        }
-        group = groups.get(key)
-        for model in (group.get("models") or []) if isinstance(group, dict) else []:
-            reasoning = model.get("reasoning") or {}
-            hint = (old_models.get(str(model.get("config_name") or "")) or {}).get(
-                "reasoning"
-            ) or {}
-            # IDE 自己给的档位常常不全（只剩 high），上次缓存里的 Web 档位更完整，
-            # 所以只要有能力声明就整段换成缓存的档位。
-            if reasoning.get("supported") and hint.get("levels"):
-                model["reasoning"] = dict(hint)
-    result["model_count"] = sum(
+        for model in (web_groups.get(key) or {}).get("models") or []:
+            if isinstance(model, Mapping):
+                name = str(model.get("config_name") or "")
+                if name:
+                    web_models.setdefault(name, model)
+    if web_models:
+        # IDE 自己给的档位常常不全（只剩 high），Web 目录里的才是完整档位
+        for key in ("ide", "solo"):
+            group = base["groups"].get(key)
+            if not isinstance(group, dict):
+                continue
+            for model in group.get("models") or []:
+                if not isinstance(model, dict):
+                    continue
+                reasoning = model.get("reasoning") or {}
+                hint = (
+                    web_models.get(str(model.get("config_name") or "")) or {}
+                ).get("reasoning") or {}
+                if reasoning.get("supported") and hint.get("levels"):
+                    model["reasoning"] = dict(hint)
+    base["model_count"] = sum(
         int(group.get("model_count") or 0)
-        for group in groups.values()
+        for group in base["groups"].values()
         if isinstance(group, dict)
     )
+    return base
 
 
 async def _scheduled_update_check() -> None:
@@ -465,7 +489,9 @@ def create_app(
     checkin = checkin_service.CheckinService(
         config=config, db=db, accounts=accounts, transport=transport
     )
-    catalog_cache = model_catalog.CatalogCache(ttl=config.model_catalog_ttl)
+    catalog_cache = model_catalog.CatalogCache(
+        db, ttl=config.model_catalog_ttl
+    )
     refresher = TokenRefresher(
         accounts,
         refresh_window=config.refresh_window,
@@ -714,58 +740,54 @@ def create_app(
         return {"ok": True}
 
     def _model_catalog_for(
-        account_id: str, force: bool = False, *, background: bool = True
+        account_id: str = "", force: bool = False, *, background: bool = True
     ) -> Optional[dict[str, Any]]:
-        """取一个账号的模型目录。
+        """取全局模型目录快照，不请求上游。
 
-        ``background`` 为 False 时只读缓存：有新鲜的用新鲜的，否则用过期的，都没有就
-        返回空，既不现取也不另起线程。列模型这类只读场景用它，刷新交给错峰的后台任务。
+        目录已经是全局的一份，与账号无关；``account_id`` 只在没有任何快照时用来
+        决定先由谁去拉。刷新统一交给每天 10:00 的轮询任务，这里只读缓存。
         """
-        record = accounts.get(account_id)
-        if not record:
-            raise HTTPException(status_code=404, detail="account not found")
-        cached = catalog_cache.get(account_id, force=force)
-        if cached:
-            return cached
-        stale = catalog_cache.get_stale(account_id)
-        if not force and stale:
-            if background and catalog_cache.begin_refresh(account_id):
-                def _refresh() -> None:
-                    try:
-                        _model_catalog_for(account_id, True)
-                    except Exception:
-                        logger.warning(
-                            "background catalog refresh failed for %s",
-                            account_id,
-                            exc_info=True,
-                        )
-                    finally:
-                        catalog_cache.end_refresh(account_id)
+        catalog = _merge_snapshots(
+            catalog_cache.get(model_catalog.IDE_SCOPE),
+            catalog_cache.get(model_catalog.WEB_SCOPE),
+        )
+        if catalog is not None:
+            return catalog
+        if force and account_id:
+            # 一份快照都没有：用这个账号同步拉一次，避免列表为空
+            return refresh_catalog(account_id)
+        return None
 
-                threading.Thread(
-                    target=_refresh,
-                    name=f"catalog-refresh-{account_id}",
-                    daemon=True,
-                ).start()
-            return stale
-        if not force and not background:
-            return None
-        secrets = accounts.get_secrets(account_id)
+    def refresh_catalog(
+        account_id: str = "", force: bool = False
+    ) -> Optional[dict[str, Any]]:
+        """用一个账号拉取目录快照并落库。
+
+        IDE 与 Web 分开判断：IDE 每天一次，Web 一周一次。都不需要时直接返回现有快照；
+        ``force`` 用于手动刷新，跳过有效期检查。
+        """
+        need_ide = force or not catalog_cache.fresh(model_catalog.IDE_SCOPE)
+        need_web = force or not catalog_cache.fresh(model_catalog.WEB_SCOPE)
+        if not need_ide and not need_web:
+            return _model_catalog_for()
+        record = accounts.get(account_id) if account_id else None
+        if record is None:
+            # 没指定账号时按轮询顺序取一个，避免总是同一个人承担拉取
+            record = maintenance.catalog_account()
+        if record is None:
+            return _model_catalog_for()
+        secrets = accounts.get_secrets(record.id)
         if (
             secrets.token_expires_at
             and secrets.token_expires_at <= now_ts() + 60
             and secrets.refresh_token
         ):
-            refresher.refresh(account_id)
-            record = accounts.get(account_id) or record
-            secrets = accounts.get_secrets(account_id)
+            refresher.refresh(record.id)
+            record = accounts.get(record.id) or record
+            secrets = accounts.get_secrets(record.id)
         if not secrets.token:
             raise HTTPException(status_code=400, detail="account has no token")
-        device = _ensure_device(accounts, account_id, config)
-        # Web 目录只在通道需要它、或作为推理档位提示太久没更新时才拉
-        need_web = not config.global_ide or not catalog_cache.web_fresh(
-            account_id, WEB_CATALOG_TTL
-        )
+        device = _ensure_device(accounts, record.id, config)
         result = model_catalog.fetch_catalog(
             config,
             secrets.token,
@@ -773,17 +795,60 @@ def create_app(
             device,
             transport=transport,
             include_web=need_web,
+            include_ide=need_ide,
         )
-        if not need_web:
-            _carry_web_catalog(result, stale)
-        result["ok"] = bool(result.get("groups"))
-        result["account_id"] = account_id
-        result["account"] = record.to_public()
-        catalog_cache.put(account_id, result, full=need_web)
-        return result
+        groups = result.get("groups") or {}
+        if need_ide:
+            ide_groups = {
+                key: group
+                for key, group in groups.items()
+                if key not in WEB_CATALOG_GROUPS
+            }
+            if ide_groups:
+                catalog_cache.put(
+                    model_catalog.IDE_SCOPE,
+                    {
+                        "groups": ide_groups,
+                        "errors": result.get("errors") or {},
+                        "fetched_at": result.get("fetched_at"),
+                        "model_count": sum(
+                            int(group.get("model_count") or 0)
+                            for group in ide_groups.values()
+                            if isinstance(group, dict)
+                        ),
+                    },
+                    record.id,
+                )
+        if need_web:
+            web_groups = {
+                key: group
+                for key, group in groups.items()
+                if key in WEB_CATALOG_GROUPS
+            }
+            if web_groups:
+                catalog_cache.put(
+                    model_catalog.WEB_SCOPE,
+                    {
+                        "groups": web_groups,
+                        "errors": result.get("errors") or {},
+                        "fetched_at": result.get("fetched_at"),
+                        "model_count": sum(
+                            int(group.get("model_count") or 0)
+                            for group in web_groups.values()
+                            if isinstance(group, dict)
+                        ),
+                    },
+                    record.id,
+                )
+        merged = _model_catalog_for()
+        if merged is not None:
+            merged["ok"] = bool(merged.get("groups"))
+            merged["account_id"] = record.id
+            merged["account"] = record.to_public()
+        return merged
 
-    # 后台任务用它刷新目录；只在需要时拉 Web 部分，与上面的逻辑保持一致
-    maintenance.catalog_for = lambda account_id: _model_catalog_for(account_id, True)
+    # 后台任务用它刷新目录快照
+    maintenance.catalog_for = refresh_catalog
     maintenance.catalog_cache = catalog_cache
 
     # -- account reads ---------------------------------------------------
@@ -853,7 +918,10 @@ def create_app(
     def refresh_account_models(
         account_id: str, _: str = Depends(current_admin)
     ) -> dict[str, Any]:
-        catalog = _model_catalog_for(account_id, force=True)
+        # 目录是全局快照：这个入口用指定账号拉一次并更新快照
+        if not accounts.get(account_id):
+            raise HTTPException(status_code=404, detail="account not found")
+        catalog = refresh_catalog(account_id)
         public = json.loads(json.dumps(catalog, ensure_ascii=False))
         for group in (public.get("groups") or {}).values():
             if not isinstance(group, dict):
@@ -1124,7 +1192,6 @@ def create_app(
             raise HTTPException(status_code=404, detail="account not found")
         accounts.delete(account_id, actor="admin")
         admin.audit(user_id, "account_delete", account_id)
-        catalog_cache.invalidate(account_id)
         events.publish({"type": "account_deleted", "account_id": account_id})
         return {"ok": True}
 
@@ -1164,6 +1231,7 @@ def create_app(
             "token_refresh_margin_hours": config.token_refresh_margin_hours,
             "keepalive_time": config.keepalive_time,
             "credit_refresh_times": config.credit_refresh_times,
+            "catalog_refresh_time": config.catalog_refresh_time,
             "version": VERSION,
         }
         return {
@@ -1470,8 +1538,6 @@ exit /b %RC%
             transport=transport,
             ensure_device=_ensure_device,
             model_catalog_for=_model_catalog_for,
-            warm_catalogs=lambda: maintenance.start_manual("catalogs"),
-            catalog_fresh=lambda account_id: bool(catalog_cache.get(account_id)),
             account_router=account_router,
             async_client=http_client,
         )
@@ -1532,22 +1598,13 @@ exit /b %RC%
 
     if config.prewarm_catalogs:
         def _prewarm_catalogs() -> None:
-            # 逐个账号预热并留出间隔，避免服务一启动就对全部账号同时拉目录
-            previous = False
-            for record in accounts.list():
-                if record.status != STATUS_ACTIVE:
-                    continue
-                if previous:
-                    time.sleep(max(0, int(config.account_stagger_seconds)))
-                previous = True
-                try:
-                    _model_catalog_for(record.id, False)
-                except Exception:
-                    logger.warning(
-                        "catalog prewarm failed for %s",
-                        record.id,
-                        exc_info=True,
-                    )
+            # 快照已落库：只有一份都没有时才用轮询到的那个账号拉一次
+            if catalog_cache.get(model_catalog.IDE_SCOPE) is not None:
+                return
+            try:
+                refresh_catalog()
+            except Exception:
+                logger.warning("catalog prewarm failed", exc_info=True)
 
         threading.Thread(
             target=_prewarm_catalogs,

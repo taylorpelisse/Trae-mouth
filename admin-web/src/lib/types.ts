@@ -298,6 +298,8 @@ export type MaintenanceStatus = {
   token_refresh_margin_hours: number;
   keepalive_time: string;
   credit_refresh_times: string[];
+  catalog_refresh_time: string;
+  catalog_account: { account_id: string; label: string } | null;
   invalid_times: Record<string, boolean>;
   safety: { next_run: number; last: MaintenanceSummary | null };
   jobs: Record<string, MaintenanceJob>;

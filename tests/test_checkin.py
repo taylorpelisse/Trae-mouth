@@ -92,7 +92,8 @@ def env(config, monkeypatch):
     return SimpleNamespace(app=app, client=client, upstream=upstream, add=add)
 
 
-MORNING = dt.datetime(2026, 11, 26, 9, 0)
+# 用当天日期：AutoCheckin.status() 按真实日期判断当天进度，写死日期会在跨天后失效
+MORNING = dt.datetime.combine(dt.date.today(), dt.time(9, 0))
 
 
 def test_checkin_device_id_is_stable_and_rotates() -> None:

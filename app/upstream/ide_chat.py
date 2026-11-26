@@ -74,9 +74,42 @@ _DSML_KINDS = {
     "invoke": "invoke",
     "parameter": "parameter",
 }
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S | re.I)
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*</(?:\w+:)?tool_call>", re.S | re.I
+)
 _DOUBAO_CALL_RE = re.compile(
     r"<\|FunctionCallBegin\|>\s*(.*?)\s*<\|FunctionCallEnd\|>", re.S | re.I
+)
+# 模型自发使用的 XML 调用格式，三种写法都要认：
+#   <function=Read>...</function>          （gfw/自造标记常见）
+#   <function=Read> / function=Read>       （漏写尖括号）
+#   <invoke name="Read">...</function>     （DSML 混写）
+_XML_FUNC_OPEN_RE = re.compile(
+    r"<?\s*function\s*=\s*\"?(?P<name1>[^\"\s<>]+)\"?\s*(?=>|<)"
+    r"|<invoke\s+name\s*=\s*\"(?P<name2>[^\"]+)\"[^>]*>",
+    re.I,
+)
+#   <parameter=path>v</parameter>          （自造标记）
+#   <parameter name="path">v</parameter>   （DSML 风格）
+_XML_PARAM_RE = re.compile(
+    r"<parameter\s*=\s*\"?(?P<key1>[^\"\s<>]+)\"?\s*[^>]*>(?P<val1>.*?)</parameter>"
+    r"|<parameter\s+name\s*=\s*\"(?P<key2>[^\"]+)\"[^>]*>(?P<val2>.*?)</parameter>",
+    re.S | re.I,
+)
+# 裸写法：<tool_call>read_file<path>v</parameter></function>
+# 既没有 function= 也没有 <parameter=，只能按 </function> 分段解析。
+_BARE_PARAM_RE = re.compile(
+    r"<(?!tool_call\b|function\b|parameter\b|arg_value\b|function_calls\b)"
+    r"(?P<key>[A-Za-z_][\w.\-]*)\s*>(?P<val>.*?)</parameter>",
+    re.S | re.I,
+)
+_BARE_NAME_RE = re.compile(
+    r"\s*(?:<tool_call>\s*)?(?P<name>[A-Za-z_][\w.\-]*)", re.I
+)
+# 最退化的写法：read_file  path=/tmp/a.txt 或 read_file(path="/tmp/a.txt")
+_BARE_KV_RE = re.compile(
+    r"(?P<key>[A-Za-z_][\w.\-]*)\s*=\s*"
+    r"(?P<val>\"[^\"]*\"|'[^']*'|[^\s,;<>\"')\]]+)"
 )
 # DSML blocks are located by _scan_dsml; these only flag the JSON-style markers.
 _NATIVE_OPEN_RES = (
@@ -299,6 +332,139 @@ def _parse_json_tool_calls(block: str) -> list[dict[str, Any]]:
     return calls
 
 
+def _parse_xml_tool_calls(block: str) -> list[dict[str, Any]]:
+    """解析 ``<function=X><parameter=Y>v</parameter></function>`` 形式的调用。
+
+    模型对这套 XML 写法比对自定义 JSON 标记熟得多，长上下文里遵循率明显更高。
+    同一段里可以有多个 function，参数值保留原样字符串交给下游 schema 归一化。
+    """
+
+    calls: list[dict[str, Any]] = []
+    # glm-5.1 会把 DSML 标记和裸 <parameter=x> 混着写，先把 DSML 前缀抹成
+    # 普通尖括号，后面的 XML 规则就能统一处理。
+    block = re.sub(rf"<\s*(?:{_DSML})\s*", "<", block)
+    openings = list(_XML_FUNC_OPEN_RE.finditer(block))
+    for index, match in enumerate(openings):
+        name = (match.group("name1") or match.group("name2") or "").strip()
+        if not name:
+            continue
+        end = openings[index + 1].start() if index + 1 < len(openings) else len(block)
+        body = block[match.end() : end]
+        arguments: dict[str, Any] = {}
+        for param in _XML_PARAM_RE.finditer(body):
+            key = (param.group("key1") or param.group("key2") or "").strip()
+            if not key:
+                continue
+            value = (
+                param.group("val1")
+                if param.group("val1") is not None
+                else param.group("val2")
+            )
+            arguments[key] = (value or "").strip("\n")
+        calls.append({"name": name, "arguments": arguments})
+    if calls:
+        return calls
+    # glm-5.3 的裸写法五花八门：
+    #   <tool_call>read_file<path>v</parameter></function>
+    #   <tool_call>read_file><parameter=path>v</parameter></function>
+    #   <tool_call>read_file(path="v")
+    #   <tool_call>read_file  path=v</arg_value>
+    # 没有 function=/invoke 可依，按 </function> 分段后依次尝试三种参数写法。
+    bare_kv = _BARE_KV_RE if "<tool_call" in block.lower() else None
+    for segment in re.split(r"</function\s*>", block, flags=re.I):
+        name_match = _BARE_NAME_RE.match(segment)
+        if not name_match:
+            continue
+        arguments: dict[str, Any] = {}
+        for param in _XML_PARAM_RE.finditer(segment):
+            key = (param.group("key1") or param.group("key2") or "").strip()
+            if not key:
+                continue
+            value = (
+                param.group("val1")
+                if param.group("val1") is not None
+                else param.group("val2")
+            )
+            arguments.setdefault(key, (value or "").strip("\n"))
+        for key, value in _BARE_PARAM_RE.findall(segment):
+            arguments.setdefault(key.strip(), value.strip("\n"))
+        if not arguments and bare_kv is not None:
+            for key, value in bare_kv.findall(segment):
+                arguments.setdefault(key.strip(), value.strip("\"'"))
+        if not arguments:
+            continue
+        calls.append(
+            {
+                "name": name_match.group("name").strip(),
+                "arguments": arguments,
+            }
+        )
+    return calls
+
+
+def _call_attempt_complete(text: str) -> bool:
+    """判断一段调用标记是否写到收尾（避免把写到一半的参数当合法调用）。"""
+
+    lowered = text.lower()
+    if "</function" in lowered or "</invoke" in lowered:
+        return True
+    if "</parameter" in lowered:
+        return lowered.count("<parameter") <= lowered.count("</parameter>")
+    return False
+
+
+def _bare_style_only(text: str) -> bool:
+    """只有裸写法（没有 <parameter / <function）时，截断无从判断。"""
+
+    lowered = text.lower()
+    return not any(
+        marker in lowered
+        for marker in ("<parameter", "function=", "<invoke")
+    )
+
+
+def _salvage_native_xml(text: str) -> list[dict[str, Any]]:
+    """收走漏在正文里的 XML 调用；写到一半的参数一律不收。"""
+
+    if _call_attempt_complete(text):
+        return _parse_xml_tool_calls(text)
+    if "<tool_call" in text.lower() and _bare_style_only(text):
+        # 退化写法没有参数开标签，分不清截断；只接受解析出参数的调用。
+        return [call for call in _parse_xml_tool_calls(text) if call["arguments"]]
+    return []
+
+
+def _looks_like_call_attempt(text: str) -> bool:
+    """整段是不是一次（可能是截断的）工具调用，而不是正文里引用的标记。"""
+
+    lowered = text.lower()
+    if _call_attempt_complete(text):
+        return True
+    if "<function=" in lowered or "<invoke" in lowered:
+        return True
+    match = re.search(r"<tool_call>\s*", lowered)
+    if not match:
+        return _DSML_HINT_RE.search(text) is not None
+    return bool(re.match(r"[<A-Za-z_]", lowered[match.end() :]))
+
+
+def detect_tool_format(text: str) -> str:
+    """粗分模型实际使用的调用写法，用于统计哪些解析分支还在被使用。"""
+
+    lowered = text.lower()
+    if "trae_mouth_tool_call" in lowered:
+        return "legacy_marker"
+    if _DSML_HINT_RE.search(text):
+        return "dsml"
+    if "<|functioncallbegin|>" in lowered:
+        return "doubao_json"
+    if _XML_FUNC_OPEN_RE.search(text):
+        return "xml_function"
+    if "<tool_call>" in lowered:
+        return "tool_call_block"
+    return "none"
+
+
 def _extract_native_tool_calls(
     text: str, *, final: bool = False
 ) -> tuple[str, list[dict[str, Any]], str, bool]:
@@ -322,7 +488,9 @@ def _extract_native_tool_calls(
     calls.extend(dsml_calls)
 
     def replace_tool_call(match: re.Match[str]) -> str:
-        calls.extend(_parse_json_tool_calls(match.group(1)))
+        body = match.group(1)
+        parsed = _parse_json_tool_calls(body) or _parse_xml_tool_calls(body)
+        calls.extend(parsed)
         return ""
 
     visible = _TOOL_CALL_RE.sub(replace_tool_call, visible)
@@ -333,6 +501,20 @@ def _extract_native_tool_calls(
 
     visible = _DOUBAO_CALL_RE.sub(replace_doubao, visible)
 
+    if _DSML_HINT_RE.search(visible):
+        # DSML 外壳里混裸 XML 的情况两头都可能出：整段都混（glm-4.7-auto），
+        # 或只有后面一块混（deepseek 先给一块完整 DSML、再给一块裸参数）。
+        # 后一种 DSML 扫描器会把裸参数块当“正文里引用的标记”放回 visible，
+        # 这里统一用 XML 规则再解析一遍残段。
+        marker = re.search(rf"<\s*(?:{_DSML})", visible, re.I)
+        start = marker.start() if marker else 0
+        hybrid = _salvage_native_xml(visible[start:])
+        if hybrid:
+            for call in hybrid:
+                if call not in calls:
+                    calls.append(call)
+            visible = visible[:start]
+
     openings = [
         match.start()
         for pattern in _NATIVE_OPEN_RES
@@ -340,7 +522,16 @@ def _extract_native_tool_calls(
     ]
     if openings:
         start = min(openings)
-        return visible[:start], calls, visible[start:] + dsml_tail, truncated
+        tail = visible[start:] + dsml_tail
+        if final:
+            # 大多数模型只写 <tool_call> 开头、忘了闭合标签，整段只能当作
+            # 不完整尾巴留着。final 时按 XML 解析一遍，成功就收成正常调用，
+            # 不然这些标记会原样漏给用户。
+            xml_calls = _salvage_native_xml(tail)
+            if xml_calls:
+                calls.extend(xml_calls)
+                return visible[:start], calls, "", truncated
+        return visible[:start], calls, tail, truncated
     return visible, calls, dsml_tail, truncated
 
 
@@ -767,8 +958,9 @@ def build_tool_prompt(
         schema_label,
         tool_payload,
         "To call one or more tools, output only blocks in this exact format and no prose:",
-        f'{TOOL_START}{{"name":"tool_name","arguments":{{}}}}{TOOL_END}',
-        "The client assigns call ids; do not invent ids. Use an exact declared tool name and arguments matching its schema.",
+        "<tool_call><function=tool_name><parameter=arg_name>value</parameter></function></tool_call>",
+        "Use an exact declared tool name and write one <parameter> tag per argument. String values are plain text; object and array values are written as JSON inside the tag.",
+        "The client assigns call ids; do not invent ids.",
         "Keep argument values as plain content: never put tool-call tags or markup inside a value, and describe such markup in words instead.",
         "Wait for the client tool result before continuing. Never claim a client file operation succeeded without a matching tool result.",
         "Lines starting with 'Client tool history' or '[client tool call]' are records of calls that already ran. Never echo, copy, or describe them as a new call.",
@@ -1369,7 +1561,8 @@ def resolve_model(
         prefer_max = True
         requested = requested[:-3]
     lowered = requested.lower()
-    groups = catalog.get("groups") or {}
+    # 目录快照可能还没拉过；没有目录时按“模型不存在”处理，不抛异常
+    groups = (catalog or {}).get("groups") or {}
     channel = CHANNEL_ALIASES.get(str(channel or "").strip().lower(), "")
     group_order = (
         [channel]

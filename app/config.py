@@ -109,7 +109,8 @@ class Config:
     refresh_device_info: bool = True
     refresh_interval: int = 300
     default_concurrency: int = 3
-    model_catalog_ttl: int = 3600
+    # 目录快照的有效期：每天刷新一次，所以按 24 小时算
+    model_catalog_ttl: int = 86400
     api_key: str = ""
     reasoning_as_content: bool = True
     strict_tool_args: bool = True
@@ -124,6 +125,7 @@ class Config:
     conversation_affinity_ttl: int = 7 * 86400
     account_failover_limit: int = 2
     account_cooldown: int = 120
+    # 目录快照已经落库，重启不需要重新拉；只在完全没有快照时后台补一次
     prewarm_catalogs: bool = True
     max_request_bytes: int = 128 * 1024 * 1024
     # 每日自动签到：开关与当天的发起时刻（HH:MM）
@@ -136,6 +138,8 @@ class Config:
     token_refresh_margin_hours: int = 24
     keepalive_time: str = "10:30"
     credit_refresh_times: str = "08:30,14:30,20:30"
+    # 模型目录每天刷一次，轮询用一个账号拉取
+    catalog_refresh_time: str = "10:00"
 
     trae_auth_host: str = "https://api.trae.cn"
     trae_client_id: str = "ono9krqynydwx5"
@@ -186,7 +190,7 @@ class Config:
             refresh_device_info=_env_bool("TRAE_REFRESH_DEVICE_INFO", True),
             refresh_interval=_env_int("TRAE_MOUTH_REFRESH_INTERVAL", 300),
             default_concurrency=_env_int("TRAE_MOUTH_DEFAULT_CONCURRENCY", 3),
-            model_catalog_ttl=_env_int("TRAE_MOUTH_MODEL_CATALOG_TTL", 3600),
+            model_catalog_ttl=_env_int("TRAE_MOUTH_MODEL_CATALOG_TTL", 86400),
             api_key=_env("TRAE_MOUTH_API_KEY"),
             reasoning_as_content=_env_bool("TRAE_MOUTH_REASONING_AS_CONTENT", True),
             strict_tool_args=_env_bool("TRAE_MOUTH_STRICT_TOOL_ARGS", True),

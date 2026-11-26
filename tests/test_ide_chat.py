@@ -206,6 +206,298 @@ def test_convert_messages_preserves_assistant_reasoning() -> None:
     assert converted[0]["reasoning"] == "the reasoning chain"
 
 
+def test_parse_xml_tool_calls() -> None:
+    block = (
+        "<function=Read><parameter=file_path>/tmp/a.py</parameter>"
+        "<parameter=offset>60</parameter><parameter=limit>11</parameter></function>"
+    )
+    calls = ide_chat._parse_xml_tool_calls(block)
+    assert calls == [
+        {
+            "name": "Read",
+            "arguments": {"file_path": "/tmp/a.py", "offset": "60", "limit": "11"},
+        }
+    ]
+
+
+def test_parse_xml_tool_calls_multiple_functions() -> None:
+    block = (
+        "<function=Read><parameter=file_path>a.py</parameter></function>\n"
+        "<function=Grep><parameter=pattern>foo</parameter></function>"
+    )
+    calls = ide_chat._parse_xml_tool_calls(block)
+    assert [call["name"] for call in calls] == ["Read", "Grep"]
+    assert calls[1]["arguments"] == {"pattern": "foo"}
+
+
+def test_tool_call_block_parses_xml_body() -> None:
+    """<tool_call> 包裹的 XML 调用也要能解析出来。"""
+    wrapped = (
+        "<tool_call><function=Write><parameter=file_path>/tmp/a.txt</parameter>"
+        "<parameter=content>hello</parameter></function></tool_call>"
+    )
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        wrapped, final=True
+    )
+    assert visible.strip() == ""
+    assert calls == [
+        {
+            "name": "Write",
+            "arguments": {"file_path": "/tmp/a.txt", "content": "hello"},
+        }
+    ]
+    assert incomplete == ""
+    assert truncated is False
+
+
+def test_tool_call_block_tolerates_namespaced_close() -> None:
+    """Doubao 会写成 </seed:tool_call>，闭合标签允许命名空间前缀。"""
+    wrapped = (
+        "<tool_call><function=read_file><parameter=path>/tmp/a.txt</parameter>"
+        "</function></seed:tool_call>"
+    )
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        wrapped, final=True
+    )
+    assert visible.strip() == ""
+    assert calls == [{"name": "read_file", "arguments": {"path": "/tmp/a.txt"}}]
+    assert incomplete == ""
+    assert truncated is False
+
+
+def test_tool_call_block_tolerates_missing_angle() -> None:
+    """glm-5 会漏写成 <tool_call>function=read_file>...。"""
+    wrapped = (
+        "<tool_call>function=read_file><parameter=path>/tmp/a.txt</parameter>"
+        "</function></tool_call>"
+    )
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        wrapped, final=True
+    )
+    assert visible.strip() == ""
+    assert calls == [{"name": "read_file", "arguments": {"path": "/tmp/a.txt"}}]
+    assert incomplete == ""
+    assert truncated is False
+
+
+def test_tool_call_block_without_closing_tag() -> None:
+    """glm 系列经常只写 <tool_call> 开头，闭合标签整段漏掉。"""
+    wrapped = (
+        "<tool_call><function=read_file><parameter=path>/tmp/a.txt</parameter>"
+        "</function>"
+    )
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        wrapped, final=True
+    )
+    assert visible.strip() == ""
+    assert calls == [{"name": "read_file", "arguments": {"path": "/tmp/a.txt"}}]
+    assert incomplete == ""
+    assert truncated is False
+
+
+def test_tool_call_block_with_dsml_invoke_mix() -> None:
+    """glm-5.1 会把 DSML 标记和裸 parameter 混着写。"""
+    wrapped = (
+        "<tool_call><｜｜DSML｜｜ calls>\n"
+        '<｜｜DSML｜｜ invoke name="read_file">'
+        "<parameter=path>/tmp/a.txt</parameter></function></tool_call>"
+    )
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        wrapped, final=True
+    )
+    assert "<tool_call>" not in visible
+    assert [call["name"] for call in calls] == ["read_file"]
+    assert calls[0]["arguments"] == {"path": "/tmp/a.txt"}
+
+
+def test_tool_call_block_truncated_argument_stays_incomplete() -> None:
+    """参数写到一半就断的，不能当成合法调用下发。"""
+    wrapped = (
+        "<tool_call><function=read_file><parameter=path>/tmp/a.txt</parameter>"
+        "<parameter=content>hel"
+    )
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        wrapped, final=True
+    )
+    assert calls == []
+    assert incomplete.startswith("<tool_call>")
+
+
+def test_parse_xml_tool_calls_name_stops_at_angle() -> None:
+    """glm-5.3 漏 < 时名字不能把后一个标签吃进去。"""
+    block = "<function=read_file<parameter=path>/tmp/a.txt</parameter></function>"
+    calls = ide_chat._parse_xml_tool_calls(block)
+    assert calls == [{"name": "read_file", "arguments": {"path": "/tmp/a.txt"}}]
+
+
+def test_dsml_block_with_bare_xml_arguments() -> None:
+    """glm-4.7-auto 只写 DSML 开头，参数和收尾用裸 XML。"""
+    block = (
+        "<｜｜DSML｜｜ calls>\n"
+        '<｜｜DSML｜｜ invoke name="read_file">'
+        "<parameter=path>/tmp/a.txt</parameter></function>"
+    )
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        block, final=True
+    )
+    assert visible.strip() == ""
+    assert calls == [{"name": "read_file", "arguments": {"path": "/tmp/a.txt"}}]
+    assert incomplete == ""
+
+
+def test_tool_call_block_without_closing_tag_multiple_calls() -> None:
+    """漏了 </tool_call> 时，同一段里的多个调用也要全部解析。"""
+    wrapped = (
+        "<tool_call>\n"
+        "<function=read_file><parameter=path>a.txt</parameter></function>\n"
+        "<function=read_file><parameter=path>b.txt</parameter></function>"
+    )
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        wrapped, final=True
+    )
+    assert visible == ""
+    assert calls == [
+        {"name": "read_file", "arguments": {"path": "a.txt"}},
+        {"name": "read_file", "arguments": {"path": "b.txt"}},
+    ]
+    assert incomplete == ""
+
+
+def test_convert_messages_multiple_tool_calls_and_results() -> None:
+    """一轮多个调用、多个结果：每个结果都要带上自己的 id/name/参数。"""
+    messages = [
+        {"role": "user", "content": "读 a.txt 和 b.txt"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_a",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+                },
+                {
+                    "id": "call_b",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path":"b.txt"}'},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_a", "content": "AAA"},
+        {"role": "tool", "tool_call_id": "call_b", "content": "BBB"},
+    ]
+    converted = ide_chat.convert_messages(messages)
+    results = [
+        item["content"][0]["text"]
+        for item in converted
+        if item["role"] == "user" and "Client tool result" in item["content"][0]["text"]
+    ]
+    assert len(results) == 2
+    assert "id=call_a" in results[0] and 'arguments={"path":"a.txt"}' in results[0]
+    assert "AAA" in results[0]
+    assert "id=call_b" in results[1] and 'arguments={"path":"b.txt"}' in results[1]
+    assert "BBB" in results[1]
+    # 助手那轮的调用记录不回显成正文，避免模型照抄
+    assert not any(
+        "read_file" in (item.get("content") or [{}])[0].get("text", "")
+        for item in converted
+        if item["role"] == "assistant"
+    )
+
+
+def test_tool_call_bare_name_format() -> None:
+    """glm-5.3 偶尔写成 <tool_call>read_file<path>v</parameter></function>。"""
+    wrapped = "<tool_call>read_file<path>/tmp/a.txt</parameter></function>"
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        wrapped, final=True
+    )
+    assert visible == ""
+    assert calls == [{"name": "read_file", "arguments": {"path": "/tmp/a.txt"}}]
+    assert incomplete == ""
+
+
+def test_parse_xml_tool_calls_bare_multiple() -> None:
+    block = (
+        "read_file<path>a.txt</parameter></function>"
+        "read_file<path>b.txt</parameter></function>"
+    )
+    calls = ide_chat._parse_xml_tool_calls(block)
+    assert calls == [
+        {"name": "read_file", "arguments": {"path": "a.txt"}},
+        {"name": "read_file", "arguments": {"path": "b.txt"}},
+    ]
+
+
+def test_parse_xml_tool_calls_bare_requires_parameter() -> None:
+    """只有标记、没有参数的散文不能当成调用。"""
+    assert ide_chat._parse_xml_tool_calls("<tool_call>read_file 一下") == []
+
+
+def test_tool_call_bare_variants() -> None:
+    """glm-5.3 抓到过的几种裸写法都要收成正常调用，且不漏标记。"""
+    samples = [
+        "<tool_call>read_file<parameter=path>/tmp/a.txt</parameter></function></arg_value>",
+        "<tool_call>read_file><parameter=path>/tmp/a.txt</parameter></function>",
+        "<tool_call>read_file  path=/tmp/a.txt</arg_value>parameter</arg_value>>"
+        "<function_calls>[:function_call_end]",
+        '<tool_call>read_file(path="/tmp/a.txt")</arg_value>parameter>value</parameter>',
+    ]
+    for sample in samples:
+        visible, calls, incomplete, _ = ide_chat._extract_native_tool_calls(
+            sample, final=True
+        )
+        assert calls == [
+            {"name": "read_file", "arguments": {"path": "/tmp/a.txt"}}
+        ], sample
+        assert visible == "", sample
+        assert incomplete == "", sample
+
+
+def test_dsml_multi_block_mixed_arguments() -> None:
+    """先完整 DSML 调用、后裸参数调用，两块都要收走。"""
+    text = (
+        "<｜｜DSML｜｜ calls>\n"
+        '<｜｜DSML｜｜ invoke name="read_file">'
+        '<｜｜DSML｜｜ parameter name="path" string="true">/tmp/b.txt'
+        "</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>\n"
+        "<｜｜DSML｜｜ calls>\n"
+        '<｜｜DSML｜｜ invoke name="read_file">'
+        "<parameter=path>/tmp/a.txt</parameter></function></tool_call>"
+    )
+    visible, calls, incomplete, truncated = ide_chat._extract_native_tool_calls(
+        text, final=True
+    )
+    assert sorted(call["arguments"]["path"] for call in calls) == [
+        "/tmp/a.txt",
+        "/tmp/b.txt",
+    ]
+    assert "<｜｜DSML" not in visible
+    assert "<parameter" not in visible
+
+
+def test_detect_tool_format() -> None:
+    assert (
+        ide_chat.detect_tool_format("<tool_call><function=Read><parameter=path>a</parameter>")
+        == "xml_function"
+    )
+    assert (
+        ide_chat.detect_tool_format('<tool_call>{"name":"Read","arguments":{}}</tool_call>')
+        == "tool_call_block"
+    )
+    assert ide_chat.detect_tool_format("<||DSML||tool_calls>") == "dsml"
+    assert (
+        ide_chat.detect_tool_format("<|FunctionCallBegin|>[]<|FunctionCallEnd|>")
+        == "doubao_json"
+    )
+    assert (
+        ide_chat.detect_tool_format(
+            "<trae_mouth_tool_call>{}</trae_mouth_tool_call>"
+        )
+        == "legacy_marker"
+    )
+    assert ide_chat.detect_tool_format("普通回答") == "none"
+
+
 def test_normalize_tool_arguments_repairs_defaults_and_types() -> None:
     schema = {
         "type": "object",
@@ -341,7 +633,7 @@ def test_large_tool_catalog_compacts_prompt(monkeypatch) -> None:
     assert '"available_tools"' in prompt
     assert '"parameters"' in prompt
     assert '"required"' in prompt
-    assert "<trae_mouth_tool_call>" in prompt
+    assert "<tool_call><function=" in prompt
 
 
 def test_tool_block_filter_extracts_and_holds_partial() -> None:
@@ -407,7 +699,7 @@ def test_convert_messages_builds_tool_prompt_and_history() -> None:
     assert converted[0]["role"] == "system"
     system_text = converted[0]["content"][0]["text"]
     assert "You are helpful." in system_text
-    assert "<trae_mouth_tool_call>" in system_text
+    assert "<tool_call><function=" in system_text
     assert not any(
         "[client tool call]" in (item.get("content") or [{}])[0].get("text", "")
         for item in converted
@@ -533,7 +825,7 @@ def test_build_body_uses_prompt_tools_not_native_tools() -> None:
     assert body["raw_chat_function"] == "chat_v3"
     assert body["stream"] is True
     assert "tools" not in body
-    assert "<trae_mouth_tool_call>" in body["messages"][0]["content"][0]["text"]
+    assert "<tool_call><function=" in body["messages"][0]["content"][0]["text"]
 
 
 def test_map_usage() -> None:

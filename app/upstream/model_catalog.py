@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import random
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -12,6 +12,8 @@ import httpx
 from ..accounts.models import DeviceProfile
 from ..config import Config
 from .catalog import ide_headers, web_headers
+
+logger = logging.getLogger(__name__)
 
 WEB_GROUPS = {
     "solo_agent_remote": ("remote", "Remote"),
@@ -460,12 +462,13 @@ def fetch_catalog(
     *,
     transport: Optional[httpx.BaseTransport] = None,
     include_web: bool = True,
+    include_ide: bool = True,
 ) -> dict[str, Any]:
     """拉取一个账号的模型目录。
 
     IDE 部分一次批量请求取回；``include_web`` 为 False 时不请求 Web 目录，
-    由调用方沿用上次的 Web 部分。Web 目录只给非 IDE 通道和推理档位提示用，
-    每次要 3 个请求，没必要跟着 IDE 部分一起刷新。
+    ``include_ide`` 为 False 时只拉 Web 部分。两者分开是因为变化频率差很多：
+    IDE 目录每天刷一次，Web 目录主要提供推理档位提示，一周一次就够。
     """
     errors: dict[str, str] = {}
     group_meta: dict[str, dict[str, Any]] = {}
@@ -500,34 +503,35 @@ def fetch_catalog(
                     if entry.reasoning_levels:
                         web_reasoning.setdefault(entry.config_name, entry)
 
-        functions = list(IDE_GROUPS)
-        try:
-            rows_by_function = _fetch_ide_all(
-                client, config, token, user_id, device, functions
-            )
-        except Exception as exc:
-            for endpoint, _label in IDE_GROUPS.values():
-                errors[endpoint] = str(exc)[:300]
-            rows_by_function = {}
-        for function, (endpoint, label) in IDE_GROUPS.items():
-            entries = prepare(endpoint, label, function)
-            for raw in rows_by_function.get(function, []):
-                entry = _ide_entry(raw, function, endpoint)
-                if not entry:
-                    continue
-                if entry.reasoning_supported:
-                    hint = web_reasoning.get(entry.config_name)
-                    if hint:
-                        # IDE 的 options 常常只剩 high 一项，官方 App 的完整档位
-                        # （lite / high / extra_high）只在 Web 目录里，所以档位
-                        # 一律以 Web 为准，不因 IDE 已有档位而跳过。
-                        entry.reasoning_levels = list(hint.reasoning_levels)
-                        entry.default_reasoning = hint.default_reasoning
-                        entry.reasoning_source = "web_catalog"
-                if entry.config_name in entries:
-                    entries[entry.config_name].merge(entry)
-                else:
-                    entries[entry.config_name] = entry
+        if include_ide:
+            functions = list(IDE_GROUPS)
+            try:
+                rows_by_function = _fetch_ide_all(
+                    client, config, token, user_id, device, functions
+                )
+            except Exception as exc:
+                for endpoint, _label in IDE_GROUPS.values():
+                    errors[endpoint] = str(exc)[:300]
+                rows_by_function = {}
+            for function, (endpoint, label) in IDE_GROUPS.items():
+                entries = prepare(endpoint, label, function)
+                for raw in rows_by_function.get(function, []):
+                    entry = _ide_entry(raw, function, endpoint)
+                    if not entry:
+                        continue
+                    if entry.reasoning_supported:
+                        hint = web_reasoning.get(entry.config_name)
+                        if hint:
+                            # IDE 的 options 常常只剩 high 一项，官方 App 的完整档位
+                            # （lite / high / extra_high）只在 Web 目录里，所以档位
+                            # 一律以 Web 为准，不因 IDE 已有档位而跳过。
+                            entry.reasoning_levels = list(hint.reasoning_levels)
+                            entry.default_reasoning = hint.default_reasoning
+                            entry.reasoning_source = "web_catalog"
+                    if entry.config_name in entries:
+                        entries[entry.config_name].merge(entry)
+                    else:
+                        entries[entry.config_name] = entry
 
     groups: dict[str, dict[str, Any]] = {}
     for endpoint, meta in group_meta.items():
@@ -549,70 +553,111 @@ def fetch_catalog(
     }
 
 
-# 每个账号的有效期在设定值上下浮动这个比例，避免全部账号同时到期
-TTL_JITTER = 0.2
+# 目录快照分两部分：IDE（ide/solo 分组，每天刷一次）与 Web（remote/work/design
+# 分组 + 推理档位提示，一周刷一次）。全局只保留一份，不再按账号各存一份：
+# 模型目录本身与账号无关，只有套餐会限制可见范围，目前所有账号都是 Free。
+IDE_SCOPE = "ide"
+WEB_SCOPE = "web"
+WEB_TTL = 7 * 86400
 
 
 class CatalogCache:
-    def __init__(self, ttl: int = 300) -> None:
-        self.ttl = max(10, int(ttl))
+    """全局目录快照；落在 SQLite 里，重启后不用重拉。"""
+
+    def __init__(
+        self, db: Any = None, ttl: int = 86400, web_ttl: int = WEB_TTL
+    ) -> None:
+        self.db = db
+        self.ttl = max(60, int(ttl))
+        self.web_ttl = max(self.ttl, int(web_ttl))
         self._lock = threading.Lock()
-        # account_id -> (写入时间, 目录, 有效期浮动系数)
-        self._data: dict[str, tuple[float, dict[str, Any], float]] = {}
-        # 上次连 Web 目录一起完整拉取的时间
-        self._web_at: dict[str, float] = {}
-        self._refreshing: set[str] = set()
+        # scope -> (写入时间, 目录, 拉取它的账号)
+        self._data: dict[str, tuple[int, dict[str, Any], str]] = {}
+        self._refreshing = False
+        self._load()
 
-    def get_stale(self, account_id: str) -> Optional[dict[str, Any]]:
+    def _load(self) -> None:
+        if self.db is None:
+            return
+        try:
+            with self.db.read() as conn:
+                rows = conn.execute(
+                    "SELECT scope, payload, fetched_at, account_id "
+                    "FROM model_catalog_snapshot"
+                ).fetchall()
+        except Exception:
+            logger.warning("catalog snapshot load failed", exc_info=True)
+            return
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                self._data[str(row["scope"])] = (
+                    int(row["fetched_at"]),
+                    payload,
+                    str(row["account_id"]),
+                )
 
+    def get(self, scope: str) -> Optional[dict[str, Any]]:
         with self._lock:
-            cached = self._data.get(account_id)
+            cached = self._data.get(scope)
         return cached[1] if cached else None
 
-    def web_fresh(self, account_id: str, ttl: int) -> bool:
+    def fetched_at(self, scope: str) -> int:
         with self._lock:
-            fetched_at = self._web_at.get(account_id)
-        return bool(fetched_at) and time.time() - fetched_at < ttl
+            cached = self._data.get(scope)
+        return cached[0] if cached else 0
 
-    def begin_refresh(self, account_id: str) -> bool:
+    def account_id(self, scope: str) -> str:
         with self._lock:
-            if account_id in self._refreshing:
+            cached = self._data.get(scope)
+        return cached[2] if cached else ""
+
+    def fresh(self, scope: str = IDE_SCOPE) -> bool:
+        cached_at = self.fetched_at(scope)
+        if not cached_at:
+            return False
+        limit = self.web_ttl if scope == WEB_SCOPE else self.ttl
+        return time.time() - cached_at < limit
+
+    def begin_refresh(self) -> bool:
+        with self._lock:
+            if self._refreshing:
                 return False
-            self._refreshing.add(account_id)
+            self._refreshing = True
             return True
 
-    def end_refresh(self, account_id: str) -> None:
+    def end_refresh(self) -> None:
         with self._lock:
-            self._refreshing.discard(account_id)
-
-    def get(self, account_id: str, force: bool = False) -> Optional[dict[str, Any]]:
-        if force:
-            return None
-        now = time.time()
-        with self._lock:
-            cached = self._data.get(account_id)
-        if not cached:
-            return None
-        fetched_at, value, factor = cached
-        if now - fetched_at > self.ttl * factor:
-            # Keep the expired value available to get_stale() for
-            # stale-while-revalidate; a background refresh replaces it.
-            return None
-        return value
+            self._refreshing = False
 
     def put(
-        self, account_id: str, value: dict[str, Any], *, full: bool = True
+        self, scope: str, payload: dict[str, Any], account_id: str = ""
     ) -> None:
+        fetched_at = int(payload.get("fetched_at") or time.time())
         with self._lock:
-            self._data[account_id] = (
-                time.time(),
-                value,
-                1 + random.uniform(-TTL_JITTER, TTL_JITTER),
-            )
-            if full:
-                self._web_at[account_id] = time.time()
+            self._data[scope] = (fetched_at, payload, account_id)
+        if self.db is None:
+            return
+        try:
+            with self.db.tx() as conn:
+                conn.execute(
+                    "INSERT INTO model_catalog_snapshot"
+                    "(scope, payload, fetched_at, account_id) VALUES(?,?,?,?) "
+                    "ON CONFLICT(scope) DO UPDATE SET payload=excluded.payload, "
+                    "fetched_at=excluded.fetched_at, account_id=excluded.account_id",
+                    (
+                        scope,
+                        json.dumps(payload, ensure_ascii=False),
+                        fetched_at,
+                        account_id,
+                    ),
+                )
+        except Exception:
+            logger.warning("catalog snapshot save failed", exc_info=True)
 
-    def invalidate(self, account_id: str) -> None:
+    def invalidate(self) -> None:
         with self._lock:
-            self._data.pop(account_id, None)
-            self._web_at.pop(account_id, None)
+            self._data.clear()

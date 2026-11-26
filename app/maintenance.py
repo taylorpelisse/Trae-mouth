@@ -19,20 +19,21 @@ import httpx
 from .accounts.store import STATUS_ACTIVE
 from .checkin import normalize_time
 from .upstream import activity
+from .upstream.model_catalog import IDE_SCOPE, WEB_SCOPE
 
 logger = logging.getLogger(__name__)
 
 STATE_KEY = "maintenance_state"
+CATALOG_STATE_KEY = "catalog:rotate"
 # 每小时一次的兜底检查：令牌剩余不足这个时间的账号立即刷新
 SAFETY_WINDOW = 6 * 3600
 MAX_SLOTS = 12
-# 每个任务对单个账号依次做什么。模型目录没有固定时刻，只按需在后台刷新。
+# 每个任务对单个账号依次做什么。模型目录是全局快照，单独走轮询逻辑。
 JOB_ACTIONS: dict[str, tuple[str, ...]] = {
     "token": ("token",),
     "keepalive": ("profile",),
     "credits": ("credits",),
     "sync": ("token", "profile", "credits"),
-    "catalogs": ("catalog",),
 }
 JOB_LABELS = {
     "token": "令牌刷新",
@@ -41,7 +42,7 @@ JOB_LABELS = {
     "sync": "全部刷新",
     "catalogs": "模型目录",
 }
-SCHEDULED_JOBS = ("token", "keepalive", "credits")
+SCHEDULED_JOBS = ("token", "keepalive", "credits", "catalogs")
 PROFILE_NAME_KEYS = ("ScreenName", "screenName", "NickName", "nickName", "Name")
 # 一个账号做了几件事时，结果取最差的那个
 _STATUS_RANK = {"ok": 0, "skipped": 1, "failed": 2}
@@ -266,6 +267,9 @@ class AccountMaintenance:
             return [text] if text else []
         if job == "credits":
             return normalize_times(getattr(self.config, "credit_refresh_times", ""))
+        if job == "catalogs":
+            text = normalize_time(getattr(self.config, "catalog_refresh_time", ""))
+            return [text] if text else []
         return []
 
     # -- stagger ----------------------------------------------------------
@@ -388,7 +392,10 @@ class AccountMaintenance:
 
         ``force`` 用于模型目录：连仍在有效期内的账号也重新拉取。
         """
-        if job not in JOB_ACTIONS or job in self._running or job in self._manual:
+        if (
+            job not in JOB_ACTIONS
+            and job != "catalogs"
+        ) or job in self._running or job in self._manual:
             return False
         self._manual.add(job)
         trigger = "force" if force else "manual"
@@ -403,7 +410,13 @@ class AccountMaintenance:
             logger.exception("manual %s failed", job)
 
     async def run(self, job: str, trigger: str = "auto") -> dict[str, Any]:
-        """给全部启用账号各执行一遍，账号之间错峰。"""
+        """跑一个维护任务。
+
+        账号级任务（令牌/保活/积分）对全部启用账号各执行一遍；目录任务只用一个
+        账号拉全局快照，按轮询顺序换账号。
+        """
+        if job == "catalogs":
+            return await self._run_catalogs(trigger)
         actions = JOB_ACTIONS[job]
         self._running.add(job)
         self._progress[job] = 0
@@ -469,10 +482,127 @@ class AccountMaintenance:
         """这一轮对这个账号是否完全不用请求上游；是的话返回跳过原因。"""
         if "token" in actions:
             return self._token_skip_reason(record, trigger)
-        if "catalog" in actions and trigger != "force" and self.catalog_cache is not None:
-            if self.catalog_cache.get(record.id):
-                return "目录仍在有效期内"
         return ""
+
+    # -- catalog rotation -------------------------------------------------
+    # 目录是全局快照，只需要一个账号去拉。每次轮到下一个账号，轮完一圈再从头，
+    # 这样不会长期只用同一个账号，也不会每次把所有账号都打一遍。
+
+    def catalog_order(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.db.get_setting(CATALOG_STATE_KEY))
+        except (TypeError, ValueError):
+            data = None
+        state: dict[str, Any] = {"order": [], "cursor": 0}
+        if isinstance(data, dict):
+            if isinstance(data.get("order"), list):
+                state["order"] = [str(item) for item in data["order"]]
+            if isinstance(data.get("cursor"), int) and data["cursor"] >= 0:
+                state["cursor"] = data["cursor"]
+        return state
+
+    def _save_catalog_order(self, state: dict[str, Any]) -> None:
+        self.db.set_setting(CATALOG_STATE_KEY, json.dumps(state, ensure_ascii=False))
+
+    def _catalog_plan(self) -> tuple[list[str], int, dict[str, Any]]:
+        """当前轮询顺序、游标和账号表；不写库，状态查询可以放心调用。"""
+        records = self.active()
+        if not records:
+            return [], 0, {}
+        by_id = {record.id: record for record in records}
+        state = self.catalog_order()
+        order = [item for item in state["order"] if item in by_id]
+        for record in records:
+            if record.id not in order:
+                order.append(record.id)
+        if not state["order"]:
+            random.shuffle(order)
+        return order, state["cursor"] % len(order), by_id
+
+    def catalog_account(self, *, save: bool = True) -> Optional[Any]:
+        """轮询里轮到的账号；顺序第一次运行时打乱后固定。"""
+        order, cursor, by_id = self._catalog_plan()
+        if not order:
+            return None
+        if save:
+            self._save_catalog_order({"order": order, "cursor": cursor})
+        return by_id[order[cursor]]
+
+    def advance_catalog(self) -> None:
+        """游标前进一位；拉取失败也前进，避免卡在坏账号上。"""
+        state = self.catalog_order()
+        if state["order"]:
+            state["cursor"] = (state["cursor"] + 1) % len(state["order"])
+            self._save_catalog_order(state)
+
+    def catalog_next_run(self, now: Optional[dt.datetime] = None) -> Optional[int]:
+        return self.next_run("catalogs", now)
+
+    async def _run_catalogs(self, trigger: str = "auto") -> dict[str, Any]:
+        """用一个账号拉全局目录快照，成功后把游标移到下一个账号。
+
+        定时任务、手动刷新、启动补拉都走这里，所以任何一次都只发一组请求。
+        """
+        self._running.add("catalogs")
+        self._progress["catalogs"] = 0
+        started = int(time.time())
+        items: list[dict[str, Any]] = []
+        try:
+            record = self.catalog_account()
+            if record is None:
+                summary = {
+                    "job": "catalogs",
+                    "trigger": trigger,
+                    "label": JOB_LABELS["catalogs"],
+                    "at": started,
+                    "finished": int(time.time()),
+                    "total": 0,
+                    "ok": 0,
+                    "failed": 1,
+                    "skipped": 0,
+                    "items": [
+                        {
+                            "account_id": "",
+                            "label": "",
+                            "status": "failed",
+                            "detail": "没有可用账号",
+                        }
+                    ],
+                }
+            else:
+                status, detail = await self._catalog(
+                    record, force=trigger == "force"
+                )
+                items.append(self._item(record, status, detail))
+                # 失败也前进：坏账号不能长期占着轮询位
+                self.advance_catalog()
+                self._progress["catalogs"] = 1
+                summary = {
+                    "job": "catalogs",
+                    "trigger": trigger,
+                    "label": JOB_LABELS["catalogs"],
+                    "at": started,
+                    "finished": int(time.time()),
+                    "total": 1,
+                    "ok": sum(1 for item in items if item["status"] == "ok"),
+                    "failed": sum(1 for item in items if item["status"] == "failed"),
+                    "skipped": sum(
+                        1 for item in items if item["status"] == "skipped"
+                    ),
+                    "items": items,
+                }
+            state = self._state()
+            state.setdefault("last", {})["catalogs"] = summary
+            self._save_state(state)
+            logger.info(
+                "maintenance catalogs (%s): %s",
+                trigger,
+                items[0]["detail"] if items else "no account",
+            )
+            return summary
+        finally:
+            self._running.discard("catalogs")
+            self._progress.pop("catalogs", None)
 
     async def _act(
         self, action: str, record: Any, job: str, trigger: str
@@ -505,10 +635,14 @@ class AccountMaintenance:
             return f"令牌还有 {remaining // 3600} 小时才到期"
         return ""
 
-    async def _catalog(self, record: Any) -> tuple[str, str]:
+    async def _catalog(
+        self, record: Any, force: bool = False
+    ) -> tuple[str, str]:
         if self.catalog_for is None:
             return "skipped", "模型目录刷新没有接入"
-        result = await asyncio.to_thread(self.catalog_for, record.id)
+        result = await asyncio.to_thread(
+            self.catalog_for, record.id, force
+        )
         count = int(result.get("model_count") or 0) if isinstance(result, dict) else 0
         if not count:
             return "failed", "没有取到模型目录"
@@ -589,6 +723,20 @@ class AccountMaintenance:
         now = now or dt.datetime.now()
         last = self._state().get("last") or {}
         total = len(self.active())
+        # 下次轮到哪个账号拉目录，给设置页显示用（只读，不写库）
+        pending_catalog = self.catalog_account(save=False)
+        next_account = (
+            {
+                "account_id": pending_catalog.id,
+                "label": str(
+                    pending_catalog.label
+                    or pending_catalog.username
+                    or pending_catalog.id
+                ),
+            }
+            if pending_catalog is not None
+            else None
+        )
         jobs = {}
         for job, label in JOB_LABELS.items():
             running = self.is_running(job)
@@ -610,6 +758,8 @@ class AccountMaintenance:
             "token_refresh_margin_hours": self.margin_seconds // 3600,
             "keepalive_time": getattr(self.config, "keepalive_time", ""),
             "credit_refresh_times": self.slots("credits"),
+            "catalog_refresh_time": getattr(self.config, "catalog_refresh_time", ""),
+            "catalog_account": next_account,
             "invalid_times": {
                 "token_refresh_time": bool(getattr(self.config, "token_refresh_time", ""))
                 and not self.slots("token"),
@@ -617,6 +767,10 @@ class AccountMaintenance:
                 and not self.slots("keepalive"),
                 "credit_refresh_times": bool(getattr(self.config, "credit_refresh_times", ""))
                 and not self.slots("credits"),
+                "catalog_refresh_time": bool(
+                    getattr(self.config, "catalog_refresh_time", "")
+                )
+                and not self.slots("catalogs"),
             },
             "safety": {"next_run": self.next_safety(now), "last": last.get("safety")},
             "jobs": jobs,

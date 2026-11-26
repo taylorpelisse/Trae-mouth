@@ -13,11 +13,13 @@ import type {
   UpdateStatus,
 } from "../lib/types";
 import { formatTime } from "../lib/format";
+import { Progress } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
 import { SectionCard } from "../components/ui/card";
 import { PageHeader } from "../components/ui/feedback";
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
+import { SegmentedControl } from "../components/ui/segmented";
 import { Skeleton } from "../components/ui/skeleton";
 import { Switch } from "../components/ui/switch";
 
@@ -25,6 +27,22 @@ type SettingsResponse = AdminSettings & {
   settings?: Record<string, unknown>;
   raw?: Record<string, unknown>;
 };
+
+const SETTINGS_TABS = [
+  { value: "general", label: "通用" },
+  { value: "account", label: "账号" },
+  { value: "system", label: "系统" },
+  { value: "security", label: "安全" },
+] as const;
+
+type SettingsTab = (typeof SETTINGS_TABS)[number]["value"];
+
+function readSettingsTab(): SettingsTab {
+  const hash = window.location.hash.replace("#", "");
+  return SETTINGS_TABS.some((item) => item.value === hash)
+    ? (hash as SettingsTab)
+    : "general";
+}
 
 const BOOLEAN_KEYS = [
   "reasoning_as_content",
@@ -49,12 +67,9 @@ function isActiveJob(job: UpdateJob | null) {
 }
 
 function updateButtonLabel(job: UpdateJob | null, pending: boolean) {
-  if (job?.status === "downloading") {
-    return job.percent === null ? "下载中…" : `下载 ${job.percent}%`;
-  }
-  if (job?.status === "installing") {
-    return job.percent === null ? "安装中…" : `安装 ${job.percent}%`;
-  }
+  // 进度放在卡片下方的进度条里，按钮只表明当前阶段
+  if (job?.status === "downloading") return "下载中…";
+  if (job?.status === "installing") return "安装中…";
   if (job?.status === "restarting") return "重启中…";
   return pending ? "准备中…" : "一键更新";
 }
@@ -68,6 +83,19 @@ export function SettingsPage() {
   const [passwordPending, setPasswordPending] = useState(false);
   const [job, setJob] = useState<UpdateJob | null>(null);
   const jobActive = isActiveJob(job);
+  const [tab, setTab] = useState<SettingsTab>(readSettingsTab);
+
+  // 分类写进 hash，刷新或从别处跳回来都能停在原来那一页
+  useEffect(() => {
+    const sync = () => setTab(readSettingsTab());
+    window.addEventListener("hashchange", sync);
+    return () => window.removeEventListener("hashchange", sync);
+  }, []);
+
+  function changeTab(next: SettingsTab) {
+    setTab(next);
+    window.location.hash = next === "general" ? "" : next;
+  }
 
   const settingsQuery = useQuery({
     queryKey: ["admin", "settings"],
@@ -309,6 +337,19 @@ export function SettingsPage() {
   );
   const updateInfo = updateQuery.data;
   const hasUpdate = Boolean(updateInfo?.available);
+  // 两段进度都换算成 0-100：下载阶段用后端百分比，进入安装后下载固定为 100
+  const downloadPercent = !job
+    ? 0
+    : job.status === "downloading"
+      ? Math.min(99, job.percent ?? 0)
+      : 100;
+  const installPercent = !job
+    ? 0
+    : job.status === "installing"
+      ? Math.min(99, job.percent ?? 0)
+      : job.status === "restarting" || job.status === "done"
+        ? 100
+        : 0;
 
   return (
     <>
@@ -322,6 +363,16 @@ export function SettingsPage() {
         }
       />
 
+      {/* 页头自带 32px 下边距，这里抵掉一半，让 Tab 上下间距与卡片间距一致（16px） */}
+      <div className="-mt-4 mb-4">
+        <SegmentedControl
+          value={tab}
+          onChange={changeTab}
+          options={SETTINGS_TABS}
+          ariaLabel="设置分类"
+        />
+      </div>
+
       {settingsQuery.isLoading ? (
         <div className="space-y-4">
           <Skeleton className="h-40 w-full rounded-panel" />
@@ -330,6 +381,7 @@ export function SettingsPage() {
         </div>
       ) : (
         <div className="space-y-4">
+          {tab === "security" ? (
           <SectionCard
             title="管理员安全"
             description="修改管理员登录密码；更新后其他会话按现有策略继续有效"
@@ -362,7 +414,10 @@ export function SettingsPage() {
               </Button>
             </form>
           </SectionCard>
+          ) : null}
 
+          {tab === "account" ? (
+          <>
           <SectionCard
             title="账号设置"
             description="针对全部账号的定时任务和批量刷新都按错峰方式执行：每次打乱顺序，账号之间留出间隔和随机抖动"
@@ -404,65 +459,48 @@ export function SettingsPage() {
                 value={values.credit_refresh_times}
                 onChange={saveCreditTimes}
               />
+              <TimeField
+                label="模型目录刷新时刻"
+                hint="每天这时用一个账号拉一次目录，账号轮流使用；留空则关闭"
+                value={values.catalog_refresh_time}
+                onChange={(value) => setField("catalog_refresh_time", value)}
+              />
             </div>
             <MaintenanceStatusLines status={maintenanceQuery.data} />
           </SectionCard>
 
-          <div className="grid gap-4 lg:grid-cols-2">
-            <SectionCard
-              title="并发与限流"
-              description="账号并发、冷却、失败换号与首字超时；换号次数最大为账号数 - 1"
-            >
-              <div className="grid grid-cols-2 gap-3">
-                <NumberField
-                  label="单账号并发数"
-                  value={values.default_concurrency}
-                  onChange={(value) => setField("default_concurrency", value)}
-                />
-                <NumberField
-                  label="冷却时长（秒）"
-                  value={values.account_cooldown}
-                  onChange={(value) => setField("account_cooldown", value)}
-                />
-                <NumberField
-                  label="最多换号次数"
-                  value={values.account_failover_limit}
-                  onChange={(value) => setField("account_failover_limit", value)}
-                />
-                <NumberField
-                  label="首字超时（秒）"
-                  value={values.first_token_timeout}
-                  onChange={(value) => setField("first_token_timeout", value)}
-                />
-              </div>
-            </SectionCard>
+          <SectionCard
+            title="并发与限流"
+            description="账号并发、冷却、失败换号与首字超时；换号次数最大为账号数 - 1"
+          >
+            <div className="grid grid-cols-2 gap-3">
+              <NumberField
+                label="单账号并发数"
+                value={values.default_concurrency}
+                onChange={(value) => setField("default_concurrency", value)}
+              />
+              <NumberField
+                label="冷却时长（秒）"
+                value={values.account_cooldown}
+                onChange={(value) => setField("account_cooldown", value)}
+              />
+              <NumberField
+                label="最多换号次数"
+                value={values.account_failover_limit}
+                onChange={(value) => setField("account_failover_limit", value)}
+              />
+              <NumberField
+                label="首字超时（秒）"
+                value={values.first_token_timeout}
+                onChange={(value) => setField("first_token_timeout", value)}
+              />
+            </div>
+          </SectionCard>
+          </>
+          ) : null}
 
-            <SectionCard
-              title="上游配置"
-              description="地址与超时修改后需重启服务生效"
-            >
-              <div className="grid gap-3">
-                <TextField
-                  label="上游地址"
-                  value={values.model_gateway}
-                  onChange={(value) => setField("model_gateway", value)}
-                />
-                <div className="grid grid-cols-2 gap-3">
-                  <NumberField
-                    label="刷新间隔（秒）"
-                    value={values.refresh_interval}
-                    onChange={(value) => setField("refresh_interval", value)}
-                  />
-                  <NumberField
-                    label="模型目录缓存（秒）"
-                    value={values.model_catalog_ttl}
-                    onChange={(value) => setField("model_catalog_ttl", value)}
-                  />
-                </div>
-              </div>
-            </SectionCard>
-          </div>
-
+          {tab === "general" ? (
+          <>
           <SectionCard
             title="行为开关"
             description="保存后影响新请求；原生工具为预留项"
@@ -505,6 +543,35 @@ export function SettingsPage() {
                 value={values.history_max_messages}
                 onChange={(value) => setField("history_max_messages", value)}
               />
+            </div>
+          </SectionCard>
+          </>
+          ) : null}
+
+          {tab === "system" ? (
+          <>
+          <SectionCard
+            title="上游配置"
+            description="地址与超时修改后需重启服务生效"
+          >
+            <div className="grid gap-3">
+              <TextField
+                label="上游地址"
+                value={values.model_gateway}
+                onChange={(value) => setField("model_gateway", value)}
+              />
+              <div className="grid grid-cols-2 gap-3">
+                <NumberField
+                  label="刷新间隔（秒）"
+                  value={values.refresh_interval}
+                  onChange={(value) => setField("refresh_interval", value)}
+                />
+                <NumberField
+                  label="模型目录缓存（秒）"
+                  value={values.model_catalog_ttl}
+                  onChange={(value) => setField("model_catalog_ttl", value)}
+                />
+              </div>
             </div>
           </SectionCard>
 
@@ -572,17 +639,37 @@ export function SettingsPage() {
                 </div>
               </div>
             )}
+            {jobActive ? (
+              <div className="mt-4 space-y-3">
+                <div>
+                  <div className="mb-1 flex items-center justify-between text-xs">
+                    <span className="text-muted">
+                      下载{job?.detail && job.status === "downloading" ? ` · ${job.detail}` : ""}
+                    </span>
+                    <span className="font-mono text-ink">{downloadPercent}%</span>
+                  </div>
+                  <Progress value={downloadPercent} />
+                </div>
+                <div>
+                  <div className="mb-1 flex items-center justify-between text-xs">
+                    <span className="text-muted">
+                      安装{job?.detail && job.status === "installing" ? ` · ${job.detail}` : ""}
+                    </span>
+                    <span className="font-mono text-ink">{installPercent}%</span>
+                  </div>
+                  <Progress value={installPercent} />
+                </div>
+                <p className="text-xs text-accent">
+                  {job?.status === "restarting"
+                    ? "更新已安装，服务重启后页面会自动刷新。"
+                    : "正在更新，请勿关闭页面。"}
+                </p>
+              </div>
+            ) : null}
             {hasUpdate && updateInfo?.notes ? (
               <pre className="mt-3 max-h-48 overflow-auto whitespace-pre-wrap rounded-tile bg-canvas p-3 text-xs text-muted">
                 {updateInfo.notes}
               </pre>
-            ) : null}
-            {jobActive ? (
-              <p className="mt-3 text-xs text-accent">
-                {job?.status === "restarting"
-                  ? "更新已安装，服务重启后页面会自动刷新。"
-                  : "正在更新，请勿关闭页面。"}
-              </p>
             ) : null}
             {job?.status === "failed" ? (
               <p className="mt-3 text-xs text-danger">
@@ -649,6 +736,8 @@ export function SettingsPage() {
               </dl>
             </details>
           </SectionCard>
+          </>
+          ) : null}
         </div>
       )}
     </>
@@ -761,41 +850,102 @@ function describeClock(epoch: number): string {
   return `${date.getMonth() + 1}/${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function describeSummary(job: MaintenanceJob): string {
+function describeNext(job: MaintenanceJob): string {
   if (job.running) return "进行中…";
-  if (!job.slots.length) return "未设定时刻";
-  return job.next_run ? `下次 ${describeClock(job.next_run)}` : "今天已完成";
+  if (!job.slots.length) return "未设定";
+  return job.next_run ? describeClock(job.next_run) : "今天已完成";
 }
 
-function describeLast(job: MaintenanceJob): string {
+function describeResult(job: MaintenanceJob): {
+  text: string;
+  tone: "muted" | "danger";
+} {
   const last = job.last;
-  if (!last) return "还没有运行过";
-  return `上次（${describeClock(last.finished)}）：成功 ${last.ok} · 失败 ${last.failed} · 跳过 ${last.skipped} · 共 ${last.total}`;
+  if (!last) return { text: "未运行", tone: "muted" };
+  return {
+    text: `${describeClock(last.finished)} · 成功 ${last.ok} · 失败 ${last.failed} · 跳过 ${last.skipped}`,
+    tone: last.failed > 0 ? "danger" : "muted",
+  };
 }
 
 function MaintenanceStatusLines({ status }: { status?: MaintenanceStatus }) {
   if (!status) {
-    return <p className="mt-3 text-xs text-muted">正在读取账号维护状态…</p>;
+    return <p className="mt-4 text-xs text-muted">正在读取账号维护状态…</p>;
   }
   const { jobs, safety, endpoints, invalid_times: invalid } = status;
+  const errors = [
+    invalid.token_refresh_time
+      ? "令牌刷新时刻格式无效，任务已停用；请改成 HH:MM 或留空"
+      : "",
+    invalid.keepalive_time
+      ? "账号保活时刻格式无效，任务已停用；请改成 HH:MM 或留空"
+      : "",
+    invalid.credit_refresh_times
+      ? "积分刷新时刻格式无效，任务已停用；请写成 HH:MM，多个用逗号隔开"
+      : "",
+    invalid.catalog_refresh_time
+      ? "模型目录刷新时刻格式无效，任务已停用；请改成 HH:MM 或留空"
+      : "",
+  ].filter(Boolean);
+  const safetyJob: MaintenanceJob = {
+    ...jobs.token,
+    slots: ["hourly"],
+    next_run: safety.next_run,
+    running: false,
+    last: safety.last,
+  };
+  const rows: { label: string; job: MaintenanceJob }[] = [
+    { label: "令牌刷新", job: jobs.token },
+    { label: "令牌兜底", job: safetyJob },
+    { label: "账号保活", job: jobs.keepalive },
+    { label: "积分刷新", job: jobs.credits },
+    { label: "模型目录", job: jobs.catalogs },
+  ];
   return (
-    <div className="mt-3 space-y-1 text-xs text-muted">
-      {invalid.token_refresh_time ? (
-        <p className="text-danger">令牌刷新时刻格式无效，这个定时任务没有运行，请改成 HH:MM 或留空。</p>
+    <div className="mt-4">
+      {errors.length ? (
+        <div className="mb-3 space-y-1">
+          {errors.map((text) => (
+            <p key={text} className="text-xs text-danger">
+              {text}
+            </p>
+          ))}
+        </div>
       ) : null}
-      {invalid.keepalive_time ? (
-        <p className="text-danger">账号保活时刻格式无效，这个定时任务没有运行，请改成 HH:MM 或留空。</p>
-      ) : null}
-      {invalid.credit_refresh_times ? (
-        <p className="text-danger">积分刷新时刻格式无效，这个定时任务没有运行，请写成 HH:MM，多个用逗号隔开或留空。</p>
-      ) : null}
-      <p>令牌刷新：{describeSummary(jobs.token)}；{describeLast(jobs.token)}</p>
-      <p>令牌兜底检查：每小时一次，{safety.next_run ? `下次 ${describeClock(safety.next_run)}` : "—"}。</p>
-      <p>账号保活：{describeSummary(jobs.keepalive)}；{describeLast(jobs.keepalive)}</p>
-      <p>积分刷新：{describeSummary(jobs.credits)}；{describeLast(jobs.credits)}</p>
-      <p>
-        刷新接口：{endpoints.native} 个账号走带设备签名的原生接口，{endpoints.legacy} 个未绑定设备只能走旧接口，
-        {endpoints.unknown} 个待判断。
+      <div className="overflow-hidden rounded-tile border border-border">
+        <div className="grid grid-cols-[5rem_5.5rem_1fr] gap-3 bg-canvas px-3 py-1.5 text-xs text-muted">
+          <span>任务</span>
+          <span>下次</span>
+          <span className="text-right">上次结果</span>
+        </div>
+        {rows.map(({ label, job }) => {
+          const result = describeResult(job);
+          return (
+            <div
+              key={label}
+              className="grid grid-cols-[5rem_5.5rem_1fr] items-center gap-3 border-t border-border px-3 py-1.5 text-xs"
+            >
+              <span className="text-ink">{label}</span>
+              <span className="text-muted">{describeNext(job)}</span>
+              <span
+                className={
+                  result.tone === "danger"
+                    ? "text-right text-danger"
+                    : "text-right text-muted"
+                }
+              >
+                {result.text}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <p className="mt-2 text-xs text-muted">
+        {status.catalog_account
+          ? `模型目录下次由 ${status.catalog_account.label} 拉取；`
+          : ""}
+        令牌刷新接口：{endpoints.native} 原生 · {endpoints.legacy} 旧接口 ·{" "}
+        {endpoints.unknown} 待判断
       </p>
     </div>
   );

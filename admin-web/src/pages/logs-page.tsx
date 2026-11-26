@@ -48,7 +48,7 @@ function logTime(seconds: number): string {
   const pad = (value: number) => String(value).padStart(2, "0");
   return `${date.getFullYear()}年${pad(date.getMonth() + 1)}月${pad(date.getDate())}日 ${pad(
     date.getHours(),
-  )}:${pad(date.getMinutes())}`;
+  )}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 export function LogsPage() {
@@ -242,7 +242,7 @@ export function LogsPage() {
         <div className="overflow-hidden rounded-card border border-border bg-card">
           <Table className="table-fixed [&_td]:py-2">
             <colgroup>
-              {["12%", "9%", "8%", "7%", "20%", "7%", "7%", "6%", "6%", "5%", "8%", "5%"].map(
+              {["15%", "4%", "8%", "10%", "17%", "9%", "5%", "6%", "6%", "4%", "12%", "4%"].map(
                 (width, index) => (
                   <col key={index} style={{ width }} />
                 ),
