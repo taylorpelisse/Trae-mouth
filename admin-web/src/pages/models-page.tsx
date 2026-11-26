@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Boxes, ClipboardCopy, RefreshCw, Search } from "lucide-react";
 import { toast } from "sonner";
 import { apiGet } from "../lib/api";
-import type { AdminModel } from "../lib/types";
+import type { AdminModel, MaintenanceStatus } from "../lib/types";
 import { copyText, formatContext } from "../lib/format";
 import { Badge } from "../components/ui/badge";
 import { Button } from "../components/ui/button";
@@ -26,7 +26,7 @@ import {
   TableRow,
 } from "../components/ui/table";
 
-type ModelList = { models: AdminModel[]; fetched_at: number };
+type ModelList = { models: AdminModel[]; fetched_at: number; loading?: boolean };
 
 const SERIES_ORDER = [
   "DeepSeek",
@@ -76,12 +76,15 @@ export function ModelsPage() {
   const [capability, setCapability] = useState("all");
   const [sort, setSort] = useState("name");
   const [refreshing, setRefreshing] = useState(false);
+  const [progress, setProgress] = useState("");
 
   const modelsQuery = useQuery({
     queryKey: ["admin", "models"],
     queryFn: () => apiGet<ModelList>("/models"),
     staleTime: 0,
     refetchOnMount: "always",
+    // 目录在后台按错峰间隔加载，定时重新读取直到齐全
+    refetchInterval: (query) => (query.state.data?.loading ? 5_000 : 30_000),
   });
   const models = modelsQuery.data?.models ?? [];
 
@@ -118,14 +121,27 @@ export function ModelsPage() {
 
   async function refresh() {
     setRefreshing(true);
+    setProgress("");
     try {
-      const data = await apiGet<ModelList>("/models?refresh=1");
+      // 刷新在后台按错峰间隔逐个账号进行，这里等它完成后再取最新目录
+      await apiGet<ModelList>("/models?refresh=1");
+      for (let round = 0; round < 900; round += 1) {
+        const status = await apiGet<MaintenanceStatus>("/maintenance", { silent: true });
+        const job = status.jobs.catalogs;
+        if (!job.running) break;
+        setProgress(
+          job.progress ? ` ${job.progress.done}/${job.progress.total}` : "",
+        );
+        await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      }
+      const data = await apiGet<ModelList>("/models");
       queryClient.setQueryData(["admin", "models"], data);
       toast.success("模型目录已刷新");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "刷新失败");
     } finally {
       setRefreshing(false);
+      setProgress("");
     }
   }
 
@@ -137,7 +153,7 @@ export function ModelsPage() {
         actions={
           <Button variant="outline" onClick={refresh} disabled={refreshing}>
             <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
-            刷新模型
+            {refreshing ? `刷新中${progress}` : "刷新模型"}
           </Button>
         }
       />

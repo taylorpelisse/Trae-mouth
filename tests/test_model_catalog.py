@@ -186,13 +186,108 @@ def test_catalog_cache() -> None:
 def test_catalog_cache_keeps_stale_value() -> None:
     cache = CatalogCache(ttl=10)
     cache.put("a", {"ok": True})
-    cache._data["a"] = (0, {"ok": True})
+    cache._data["a"] = (0, {"ok": True}, 1.0)
     assert cache.get("a") is None
     assert cache.get_stale("a") == {"ok": True}
     assert cache.begin_refresh("a") is True
     assert cache.begin_refresh("a") is False
-    assert cache.end_refresh("a") is None
+    cache.end_refresh("a")
     assert cache.begin_refresh("a") is True
+
+
+def _single_rows(function: str) -> list[dict]:
+    """逐个功能查询时的返回，用来拼出批量接口的应答。"""
+    request = httpx.Request(
+        "POST",
+        "https://trae-api-cn.mchost.guru/api/ide/v1/get_detail_param",
+        json={"function": function},
+    )
+    return handler(request).json()["config_info_list"]
+
+
+def _batch_transport(seen: list[str], working: bool = True) -> httpx.MockTransport:
+    def inner(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path.endswith(model_catalog.IDE_BATCH_PATH):
+            if not working:
+                return httpx.Response(500, text="batch unavailable")
+            functions = json.loads(request.content)["functions"]
+            return httpx.Response(
+                200,
+                json={
+                    "function_configs": [
+                        {"function": item, "config_info_list": _single_rows(item)}
+                        for item in functions
+                    ]
+                },
+            )
+        return handler(request)
+
+    return httpx.MockTransport(inner)
+
+
+def test_fetch_catalog_uses_one_batch_request_for_ide(config) -> None:
+    seen: list[str] = []
+    catalog = model_catalog.fetch_catalog(
+        config, "token", "user-1", build_device(),
+        transport=_batch_transport(seen),
+    )
+    single_seen: list[str] = []
+    reference = model_catalog.fetch_catalog(
+        config, "token", "user-1", build_device(),
+        transport=_batch_transport(single_seen, working=False),
+    )
+
+    # IDE 部分只发一个请求，结果与逐个功能查询完全相同
+    assert seen.count(model_catalog.IDE_BATCH_PATH) == 1
+    assert len(seen) == 4  # 批量目录 1 个 + Web 目录 3 个
+    # 批量接口不可用时：3 个 Web + 1 次失败的批量 + 3 个逐个查询
+    assert len(single_seen) == 7
+    for group in ("ide", "solo", "remote", "work", "design"):
+        assert catalog["groups"][group] == reference["groups"][group]
+
+
+def test_fetch_catalog_falls_back_to_per_function_queries(config) -> None:
+    seen: list[str] = []
+    catalog = model_catalog.fetch_catalog(
+        config, "token", "user-1", build_device(),
+        transport=_batch_transport(seen, working=False),
+    )
+
+    assert len([path for path in seen if path.endswith("/get_detail_param")]) == 3
+    assert catalog["groups"]["ide"]["models"][0]["config_name"] == "glm-5.4"
+    assert catalog["groups"]["solo"]["models"][0]["config_name"] == "solo-model"
+
+
+def test_fetch_catalog_can_skip_web(config) -> None:
+    seen: list[str] = []
+    catalog = model_catalog.fetch_catalog(
+        config, "token", "user-1", build_device(),
+        transport=_batch_transport(seen),
+        include_web=False,
+    )
+
+    assert set(catalog["groups"]) == {"ide", "solo"}
+    assert seen == [model_catalog.IDE_BATCH_PATH]
+
+
+def test_catalog_cache_jitter_and_web_freshness() -> None:
+    cache = CatalogCache(ttl=100)
+    cache.put("a", {"ok": True}, full=False)
+    assert not cache.web_fresh("a", 1000)
+    cache.put("a", {"ok": True})
+    assert cache.web_fresh("a", 1000)
+
+    # 每个账号的有效期在设定值上下 20% 内浮动
+    factors = set()
+    for index in range(60):
+        cache.put(f"k{index}", {"ok": True})
+        factors.add(cache._data[f"k{index}"][2])
+    assert all(0.8 <= factor <= 1.2 for factor in factors)
+    assert len(factors) > 1
+
+    cache.invalidate("a")
+    assert not cache.web_fresh("a", 1000) and cache.get("a") is None
 
 
 def test_openai_effort_uses_openai_vocabulary() -> None:

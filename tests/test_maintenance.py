@@ -19,6 +19,22 @@ CLIENT_ID = "ono9krqynydwx5"
 EXCHANGE = "/oauth/ExchangeToken"
 USER_INFO = "/cloudide/api/v3/trae/GetUserInfo"
 ENT_USAGE = "/trae/api/v2/pay/ide_user_ent_usage"
+CATALOG_BATCH = "/api/ide/v1/batch_get_detail_param"
+
+
+def catalog_row(name: str) -> dict:
+    """一个最小的 IDE 模型条目，字段结构与上游一致。"""
+    return {
+        "config_name": name,
+        "config_source": 1,
+        "usage": "chat_completion",
+        "context_window_tokens": {"dev": 116000},
+        "display_config": {"display_name": name.upper(), "model_capability": "chat_model"},
+        "model_detail_list": [
+            {"model_name": f"{name}__dev", "max_tokens": 16000, "prompt_max_tokens": 100000},
+            {"model_name": f"{name}__max", "max_tokens": 64000, "prompt_max_tokens": 936000},
+        ],
+    }
 
 
 def iso_later(seconds: int) -> str:
@@ -89,6 +105,22 @@ class Upstream:
                     ],
                 },
             )
+        if path.endswith(CATALOG_BATCH):
+            functions = json.loads(request.content)["functions"]
+            return httpx.Response(
+                200,
+                json={
+                    "function_configs": [
+                        {
+                            "function": function,
+                            "config_info_list": [catalog_row(f"model-{function}")],
+                        }
+                        for function in functions
+                    ]
+                },
+            )
+        if path.endswith("/api/remote/v1/models"):
+            return httpx.Response(200, json={"code": 0, "data": {"list": []}})
         return httpx.Response(500, text="unexpected request")
 
     def paths(self, suffix: str) -> list[str]:
@@ -392,6 +424,155 @@ def test_settings_manage_maintenance(config, env) -> None:
                 "/admin/api/settings", json={"values": {key: value}}, headers=headers
             )
             assert invalid.status_code == 400, key
+
+
+def cached_catalog(name: str) -> dict:
+    model = {
+        "config_name": name,
+        "display_name": name.upper(),
+        "endpoint": "ide",
+        "functions": ["chat_v3"],
+        "provider_models": [f"{name}__dev", f"{name}__max"],
+        "reasoning": {"supported": False, "levels": [], "default": "", "source": ""},
+    }
+    return {
+        "groups": {
+            "ide": {"label": "IDE Agent", "functions": ["chat_v3"], "models": [model], "model_count": 1}
+        },
+        "errors": {},
+        "fetched_at": 1,
+        "model_count": 1,
+        "ok": True,
+    }
+
+
+def wait_job(app, job: str) -> dict:
+    for _ in range(200):
+        status = app.state.maintenance.status()
+        if status["jobs"][job]["last"] and not status["jobs"][job]["running"]:
+            return status
+        time.sleep(0.05)
+    raise AssertionError(f"maintenance job {job} did not finish")
+
+
+def test_model_listing_reads_cache_and_refreshes_expired_in_background(config, env) -> None:
+    stale_id = env.add("user-1")
+    fresh_id = env.add("user-2")
+    config.global_ide = True
+    config.api_key = "test-key"
+    cache = env.app.state.catalog_cache
+    cache.put(stale_id, cached_catalog("stale-model"), full=False)
+    cache.put(fresh_id, cached_catalog("fresh-model"), full=False)
+    cache._data[stale_id] = (0, cache.get_stale(stale_id), 1.0)
+    headers = {"Authorization": "Bearer test-key"}
+
+    with env.client:
+        listed = env.client.get("/v1/models", headers=headers).json()
+        # 过期的目录照常返回，列模型本身不请求上游
+        assert sorted(item["id"] for item in listed["data"]) == ["fresh-model", "stale-model"]
+        assert env.upstream.paths(CATALOG_BATCH) == []
+
+        # 过期的那个账号交给后台刷新，仍在有效期内的不动
+        items = wait_job(env.app, "catalogs")["jobs"]["catalogs"]["last"]["items"]
+        assert {item["account_id"]: item["status"] for item in items} == {
+            stale_id: "ok",
+            fresh_id: "skipped",
+        }
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 1
+        # 过期的那个账号第一次拉目录时带上 Web 部分
+        assert len(env.upstream.paths("/api/remote/v1/models")) == 3
+
+        # 后台的「刷新」按钮：立即返回，全部账号在后台重新拉取
+        admin = setup_admin(env.client)
+        refreshed = env.client.get("/admin/api/models?refresh=1", headers=admin).json()
+        assert refreshed["models"]
+        wait_job(env.app, "catalogs")
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 3
+        # 另一个账号也是第一次拉 Web 目录；之后 24 小时内不再拉
+        assert len(env.upstream.paths("/api/remote/v1/models")) == 6
+        env.client.get("/admin/api/models?refresh=1", headers=admin)
+        time.sleep(0.2)
+        wait_job(env.app, "catalogs")
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 5
+        assert len(env.upstream.paths("/api/remote/v1/models")) == 6
+
+
+def test_model_listing_fetches_one_account_when_nothing_is_cached(config, env) -> None:
+    for index in range(3):
+        env.add(f"user-{index}")
+    config.api_key = "test-key"
+
+    with env.client:
+        listed = env.client.get("/v1/models", headers={"Authorization": "Bearer test-key"}).json()
+        # 刚启动一份缓存都没有：同步取一个账号保证列表不为空
+        assert [item["id"] for item in listed["data"]]
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 1
+        # 其余账号在后台错峰补齐
+        wait_job(env.app, "catalogs")
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 3
+
+
+def test_previous_web_catalog_is_carried_over() -> None:
+    from app.main import _carry_web_catalog
+
+    previous = {
+        "groups": {
+            "remote": {"label": "Remote", "models": [{"config_name": "web-only"}], "model_count": 1},
+            "ide": {
+                "models": [
+                    {
+                        "config_name": "glm",
+                        "reasoning": {"supported": True, "levels": ["light", "high"], "default": "high"},
+                    }
+                ],
+                "model_count": 1,
+            },
+        }
+    }
+    result = {
+        "groups": {
+            "ide": {
+                "models": [
+                    {"config_name": "glm", "reasoning": {"supported": True, "levels": [], "default": ""}},
+                    {"config_name": "other", "reasoning": {"supported": True, "levels": [], "default": ""}},
+                ],
+                "model_count": 2,
+            }
+        },
+        "model_count": 2,
+    }
+
+    # 这次没拉 Web 目录：Web 通道沿用上次，IDE 条目缺的推理档位从上次补上
+    _carry_web_catalog(result, previous)
+
+    assert result["groups"]["remote"] is previous["groups"]["remote"]
+    reasoning = {model["config_name"]: model["reasoning"] for model in result["groups"]["ide"]["models"]}
+    assert reasoning["glm"]["levels"] == ["light", "high"]
+    assert reasoning["other"]["levels"] == []
+    assert result["model_count"] == 3
+    # 没有上次的目录时什么都不做
+    untouched = {"groups": {"ide": {"models": [], "model_count": 0}}, "model_count": 0}
+    _carry_web_catalog(untouched, None)
+    assert untouched == {"groups": {"ide": {"models": [], "model_count": 0}}, "model_count": 0}
+
+
+def test_admin_models_page_loads_missing_catalogs_in_background(config, env) -> None:
+    env.add("user-1")
+    env.add("user-2")
+    with env.client:
+        admin = setup_admin(env.client)
+        first = env.client.get("/admin/api/models", headers=admin).json()
+        # 刚启动、目录还没预热：先返回空并标记加载中，不在这里同步拉取
+        assert first["models"] == [] and first["loading"] is True
+        assert env.upstream.paths(CATALOG_BATCH) == []
+
+        wait_job(env.app, "catalogs")
+        second = env.client.get("/admin/api/models", headers=admin).json()
+        assert second["loading"] is False
+        # 全局 IDE 开启时后台只展示 IDE 通道的模型
+        assert [model["id"] for model in second["models"]] == ["model-chat_v3"]
+        assert second["models"][0]["account_count"] == 2
+        assert len(env.upstream.paths(CATALOG_BATCH)) == 2
 
 
 def test_deleting_account_removes_its_remembered_state(config, env) -> None:

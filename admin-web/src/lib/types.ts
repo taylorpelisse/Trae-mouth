@@ -285,6 +285,8 @@ export type MaintenanceJob = {
   slots: string[];
   next_run: number | null;
   running: boolean;
+  /** 进行中时已处理的账号数 */
+  progress: { done: number; total: number } | null;
   last: MaintenanceSummary | null;
 };
 

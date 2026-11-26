@@ -109,7 +109,7 @@ class Config:
     refresh_device_info: bool = True
     refresh_interval: int = 300
     default_concurrency: int = 3
-    model_catalog_ttl: int = 300
+    model_catalog_ttl: int = 3600
     api_key: str = ""
     reasoning_as_content: bool = True
     strict_tool_args: bool = True
@@ -186,7 +186,7 @@ class Config:
             refresh_device_info=_env_bool("TRAE_REFRESH_DEVICE_INFO", True),
             refresh_interval=_env_int("TRAE_MOUTH_REFRESH_INTERVAL", 300),
             default_concurrency=_env_int("TRAE_MOUTH_DEFAULT_CONCURRENCY", 3),
-            model_catalog_ttl=_env_int("TRAE_MOUTH_MODEL_CATALOG_TTL", 300),
+            model_catalog_ttl=_env_int("TRAE_MOUTH_MODEL_CATALOG_TTL", 3600),
             api_key=_env("TRAE_MOUTH_API_KEY"),
             reasoning_as_content=_env_bool("TRAE_MOUTH_REASONING_AS_CONTENT", True),
             strict_tool_args=_env_bool("TRAE_MOUTH_STRICT_TOOL_ARGS", True),

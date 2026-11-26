@@ -814,7 +814,10 @@ def create_openai_router(
     refresher: Any,
     transport: Any,
     ensure_device: Callable[[Any, str, Any], Any],
-    model_catalog_for: Callable[[str, bool], dict[str, Any]],
+    model_catalog_for: Callable[..., Optional[dict[str, Any]]],
+    # 过期或缺失的目录交给它在后台错峰刷新；列模型本身只读缓存
+    warm_catalogs: Callable[[], None] = lambda: None,
+    catalog_fresh: Callable[[str], bool] = lambda account_id: False,
     account_router: Optional[AccountRouter] = None,
     async_client: Optional[httpx.AsyncClient] = None,
 ) -> APIRouter:
@@ -939,7 +942,7 @@ def create_openai_router(
             yield event
 
     @router.get("/v1/models")
-    def list_models(
+    async def list_models(
         request: Request,
         account_id: str = "",
         auth: ApiAuth = Depends(authorize),
@@ -963,11 +966,8 @@ def create_openai_router(
             if getattr(config, "global_ide", True)
             else ["remote", "work", "ide"]
         )
-        for record in records:
-            try:
-                catalog = model_catalog_for(record.id, False)
-            except Exception:
-                continue
+        def absorb(catalog: dict[str, Any]) -> None:
+            nonlocal fetched_at
             fetched_at = fetched_at or catalog.get("fetched_at")
             groups = catalog.get("groups") or {}
             for group_key in group_order:
@@ -984,6 +984,26 @@ def create_openai_router(
                     )
                     for model_id in model_ids:
                         models.setdefault(model_id, (model, not web))
+
+        # 没有缓存或已过期的账号：照常用手头的目录，刷新交给错峰的后台任务
+        cold: list[str] = []
+        for record in records:
+            try:
+                catalog = model_catalog_for(record.id, False, background=False)
+            except Exception:
+                continue
+            if not isinstance(catalog, dict) or not catalog_fresh(record.id):
+                cold.append(record.id)
+            if isinstance(catalog, dict):
+                absorb(catalog)
+        if not models and records:
+            # 一份缓存都没有（通常是刚启动）：同步取一个账号，保证列表不为空
+            try:
+                absorb(model_catalog_for(records[0].id, True))
+            except Exception:
+                pass
+        if cold:
+            warm_catalogs()
         data = [
             model_catalog.to_openai_model(
                 model,

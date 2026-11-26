@@ -344,17 +344,24 @@ def create_admin_console_router(
         }
 
     @router.get("/models")
-    def models(refresh: int = 0, _: str = Depends(current_admin)) -> dict[str, Any]:
+    async def models(refresh: int = 0, _: str = Depends(current_admin)) -> dict[str, Any]:
         merged: dict[str, dict[str, Any]] = {}
         records = [
             row
             for row in accounts.list()
             if row.status == STATUS_ACTIVE
         ]
+        if refresh:
+            # 刷新全部放到后台按错峰间隔进行；这里照常返回手头的目录
+            maintenance.start_manual("catalogs", force=True)
+        missing = False
         for record in records:
             try:
-                catalog = model_catalog_for(record.id, bool(refresh))
+                catalog = model_catalog_for(record.id, False, background=False)
             except Exception:
+                continue
+            if not isinstance(catalog, dict):
+                missing = True
                 continue
             groups = catalog.get("groups") or {}
             for channel, group in groups.items():
@@ -437,7 +444,10 @@ def create_admin_console_router(
             item["account_count"] = len(item.pop("_accounts"))
             models.append(item)
         models.sort(key=lambda item: item["id"].lower())
-        return {"models": models, "fetched_at": now_ts()}
+        if missing:
+            # 有账号还没取过目录（通常是刚启动）：在后台按错峰间隔加载，页面会定时重新读取
+            maintenance.start_manual("catalogs")
+        return {"models": models, "fetched_at": now_ts(), "loading": missing}
 
     @router.get("/logs")
     def logs(

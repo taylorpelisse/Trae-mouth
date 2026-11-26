@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -398,6 +399,59 @@ def _fetch_ide(
     return [row for row in rows or [] if isinstance(row, dict)]
 
 
+# 官方客户端用一个批量接口一次取回全部功能的目录；逐个功能查询只作为退路
+IDE_BATCH_PATH = "/api/ide/v1/batch_get_detail_param"
+
+
+def _fetch_ide_all(
+    client: httpx.Client,
+    config: Config,
+    token: str,
+    user_id: str,
+    device: DeviceProfile,
+    functions: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    rows_by_function: dict[str, list[dict[str, Any]]] = {}
+    try:
+        response = client.post(
+            f"{config.model_gateway}{IDE_BATCH_PATH}",
+            headers=ide_headers(
+                config, token, user_id, device, "batch_get_detail_param"
+            ),
+            json={
+                "functions": functions,
+                "access_type": None,
+                "agent_type": None,
+                "current_config_info": None,
+                "mode_type": None,
+                "Request": None,
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        groups = data.get("function_configs") if isinstance(data, dict) else None
+        for item in groups or []:
+            if not isinstance(item, dict):
+                continue
+            function = str(item.get("function") or "")
+            rows = item.get("config_info_list")
+            if function and isinstance(rows, list):
+                rows_by_function[function] = [
+                    row for row in rows if isinstance(row, dict)
+                ]
+    except Exception:
+        rows_by_function = {}
+    missing = [function for function in functions if function not in rows_by_function]
+    if not missing:
+        return rows_by_function
+    # 批量接口不可用或缺了某个功能：缺的部分退回逐个查询
+    for function in missing:
+        rows_by_function[function] = _fetch_ide(
+            client, config, token, user_id, device, function
+        )
+    return rows_by_function
+
+
 def fetch_catalog(
     config: Config,
     token: str,
@@ -405,7 +459,14 @@ def fetch_catalog(
     device: DeviceProfile,
     *,
     transport: Optional[httpx.BaseTransport] = None,
+    include_web: bool = True,
 ) -> dict[str, Any]:
+    """拉取一个账号的模型目录。
+
+    IDE 部分一次批量请求取回；``include_web`` 为 False 时不请求 Web 目录，
+    由调用方沿用上次的 Web 部分。Web 目录只给非 IDE 通道和推理档位提示用，
+    每次要 3 个请求，没必要跟着 IDE 部分一起刷新。
+    """
     errors: dict[str, str] = {}
     group_meta: dict[str, dict[str, Any]] = {}
     group_entries: dict[str, dict[str, ModelEntry]] = {}
@@ -420,34 +481,37 @@ def fetch_catalog(
         return group_entries.setdefault(endpoint, {})
 
     with httpx.Client(timeout=30, transport=transport) as client:
-        for function, (endpoint, label) in WEB_GROUPS.items():
-            entries = prepare(endpoint, label, function)
-            try:
-                rows = _fetch_web(client, config, token, user_id, function)
-            except Exception as exc:
-                errors[endpoint] = str(exc)[:300]
-                continue
-            for raw in rows:
-                entry = _web_entry(raw, function, endpoint)
-                if not entry:
+        if include_web:
+            for function, (endpoint, label) in WEB_GROUPS.items():
+                entries = prepare(endpoint, label, function)
+                try:
+                    rows = _fetch_web(client, config, token, user_id, function)
+                except Exception as exc:
+                    errors[endpoint] = str(exc)[:300]
                     continue
-                if entry.config_name in entries:
-                    entries[entry.config_name].merge(entry)
-                else:
-                    entries[entry.config_name] = entry
-                if entry.reasoning_levels:
-                    web_reasoning.setdefault(entry.config_name, entry)
+                for raw in rows:
+                    entry = _web_entry(raw, function, endpoint)
+                    if not entry:
+                        continue
+                    if entry.config_name in entries:
+                        entries[entry.config_name].merge(entry)
+                    else:
+                        entries[entry.config_name] = entry
+                    if entry.reasoning_levels:
+                        web_reasoning.setdefault(entry.config_name, entry)
 
+        functions = list(IDE_GROUPS)
+        try:
+            rows_by_function = _fetch_ide_all(
+                client, config, token, user_id, device, functions
+            )
+        except Exception as exc:
+            for endpoint, _label in IDE_GROUPS.values():
+                errors[endpoint] = str(exc)[:300]
+            rows_by_function = {}
         for function, (endpoint, label) in IDE_GROUPS.items():
             entries = prepare(endpoint, label, function)
-            try:
-                rows = _fetch_ide(
-                    client, config, token, user_id, device, function
-                )
-            except Exception as exc:
-                errors[endpoint] = str(exc)[:300]
-                continue
-            for raw in rows:
+            for raw in rows_by_function.get(function, []):
                 entry = _ide_entry(raw, function, endpoint)
                 if not entry:
                     continue
@@ -482,11 +546,18 @@ def fetch_catalog(
     }
 
 
+# 每个账号的有效期在设定值上下浮动这个比例，避免全部账号同时到期
+TTL_JITTER = 0.2
+
+
 class CatalogCache:
     def __init__(self, ttl: int = 300) -> None:
         self.ttl = max(10, int(ttl))
         self._lock = threading.Lock()
-        self._data: dict[str, tuple[float, dict[str, Any]]] = {}
+        # account_id -> (写入时间, 目录, 有效期浮动系数)
+        self._data: dict[str, tuple[float, dict[str, Any], float]] = {}
+        # 上次连 Web 目录一起完整拉取的时间
+        self._web_at: dict[str, float] = {}
         self._refreshing: set[str] = set()
 
     def get_stale(self, account_id: str) -> Optional[dict[str, Any]]:
@@ -494,6 +565,11 @@ class CatalogCache:
         with self._lock:
             cached = self._data.get(account_id)
         return cached[1] if cached else None
+
+    def web_fresh(self, account_id: str, ttl: int) -> bool:
+        with self._lock:
+            fetched_at = self._web_at.get(account_id)
+        return bool(fetched_at) and time.time() - fetched_at < ttl
 
     def begin_refresh(self, account_id: str) -> bool:
         with self._lock:
@@ -514,17 +590,26 @@ class CatalogCache:
             cached = self._data.get(account_id)
         if not cached:
             return None
-        fetched_at, value = cached
-        if now - fetched_at > self.ttl:
+        fetched_at, value, factor = cached
+        if now - fetched_at > self.ttl * factor:
             # Keep the expired value available to get_stale() for
             # stale-while-revalidate; a background refresh replaces it.
             return None
         return value
 
-    def put(self, account_id: str, value: dict[str, Any]) -> None:
+    def put(
+        self, account_id: str, value: dict[str, Any], *, full: bool = True
+    ) -> None:
         with self._lock:
-            self._data[account_id] = (time.time(), value)
+            self._data[account_id] = (
+                time.time(),
+                value,
+                1 + random.uniform(-TTL_JITTER, TTL_JITTER),
+            )
+            if full:
+                self._web_at[account_id] = time.time()
 
     def invalidate(self, account_id: str) -> None:
         with self._lock:
             self._data.pop(account_id, None)
+            self._web_at.pop(account_id, None)

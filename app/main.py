@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+import time
 import zipfile
 from contextlib import asynccontextmanager
 from typing import Any, Optional
@@ -61,7 +62,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"
@@ -370,6 +371,43 @@ def _apply_persisted_settings(config: Config, db: Database) -> None:
     config.refresh_window = max(1, min(24 * 14, hours)) * 3600
 
 
+# Web 目录只给非 IDE 通道和推理档位提示用，最多这么久更新一次
+WEB_CATALOG_TTL = 24 * 3600
+WEB_CATALOG_GROUPS = ("remote", "work", "design")
+
+
+def _carry_web_catalog(
+    result: dict[str, Any], previous: Optional[dict[str, Any]]
+) -> None:
+    """这次没拉 Web 目录时，把上次的 Web 部分和推理档位提示接到新目录上。"""
+    if not previous:
+        return
+    groups = result.setdefault("groups", {})
+    old_groups = previous.get("groups") or {}
+    for key in WEB_CATALOG_GROUPS:
+        if isinstance(old_groups.get(key), dict):
+            groups[key] = old_groups[key]
+    for key in ("ide", "solo"):
+        old_models = {
+            str(model.get("config_name") or ""): model
+            for model in (old_groups.get(key) or {}).get("models") or []
+            if isinstance(model, dict)
+        }
+        group = groups.get(key)
+        for model in (group.get("models") or []) if isinstance(group, dict) else []:
+            reasoning = model.get("reasoning") or {}
+            hint = (old_models.get(str(model.get("config_name") or "")) or {}).get(
+                "reasoning"
+            ) or {}
+            if reasoning.get("supported") and not reasoning.get("levels") and hint.get("levels"):
+                model["reasoning"] = dict(hint)
+    result["model_count"] = sum(
+        int(group.get("model_count") or 0)
+        for group in groups.values()
+        if isinstance(group, dict)
+    )
+
+
 async def _scheduled_update_check() -> None:
     while True:
         now = dt.datetime.now()
@@ -673,35 +711,43 @@ def create_app(
         admin.audit(user_id, "password_change", "")
         return {"ok": True}
 
-    def _model_catalog_for(account_id: str, force: bool = False) -> dict[str, Any]:
+    def _model_catalog_for(
+        account_id: str, force: bool = False, *, background: bool = True
+    ) -> Optional[dict[str, Any]]:
+        """取一个账号的模型目录。
+
+        ``background`` 为 False 时只读缓存：有新鲜的用新鲜的，否则用过期的，都没有就
+        返回空，既不现取也不另起线程。列模型这类只读场景用它，刷新交给错峰的后台任务。
+        """
         record = accounts.get(account_id)
         if not record:
             raise HTTPException(status_code=404, detail="account not found")
         cached = catalog_cache.get(account_id, force=force)
         if cached:
             return cached
-        if not force:
-            stale = catalog_cache.get_stale(account_id)
-            if stale:
-                if catalog_cache.begin_refresh(account_id):
-                    def _refresh() -> None:
-                        try:
-                            _model_catalog_for(account_id, True)
-                        except Exception:
-                            logger.warning(
-                                "background catalog refresh failed for %s",
-                                account_id,
-                                exc_info=True,
-                            )
-                        finally:
-                            catalog_cache.end_refresh(account_id)
+        stale = catalog_cache.get_stale(account_id)
+        if not force and stale:
+            if background and catalog_cache.begin_refresh(account_id):
+                def _refresh() -> None:
+                    try:
+                        _model_catalog_for(account_id, True)
+                    except Exception:
+                        logger.warning(
+                            "background catalog refresh failed for %s",
+                            account_id,
+                            exc_info=True,
+                        )
+                    finally:
+                        catalog_cache.end_refresh(account_id)
 
-                    threading.Thread(
-                        target=_refresh,
-                        name=f"catalog-refresh-{account_id}",
-                        daemon=True,
-                    ).start()
-                return stale
+                threading.Thread(
+                    target=_refresh,
+                    name=f"catalog-refresh-{account_id}",
+                    daemon=True,
+                ).start()
+            return stale
+        if not force and not background:
+            return None
         secrets = accounts.get_secrets(account_id)
         if (
             secrets.token_expires_at
@@ -714,18 +760,29 @@ def create_app(
         if not secrets.token:
             raise HTTPException(status_code=400, detail="account has no token")
         device = _ensure_device(accounts, account_id, config)
+        # Web 目录只在通道需要它、或作为推理档位提示太久没更新时才拉
+        need_web = not config.global_ide or not catalog_cache.web_fresh(
+            account_id, WEB_CATALOG_TTL
+        )
         result = model_catalog.fetch_catalog(
             config,
             secrets.token,
             record.user_id,
             device,
             transport=transport,
+            include_web=need_web,
         )
+        if not need_web:
+            _carry_web_catalog(result, stale)
         result["ok"] = bool(result.get("groups"))
         result["account_id"] = account_id
         result["account"] = record.to_public()
-        catalog_cache.put(account_id, result)
+        catalog_cache.put(account_id, result, full=need_web)
         return result
+
+    # 后台任务用它刷新目录；只在需要时拉 Web 部分，与上面的逻辑保持一致
+    maintenance.catalog_for = lambda account_id: _model_catalog_for(account_id, True)
+    maintenance.catalog_cache = catalog_cache
 
     # -- account reads ---------------------------------------------------
     @app.get("/admin/api/accounts")
@@ -1411,6 +1468,8 @@ exit /b %RC%
             transport=transport,
             ensure_device=_ensure_device,
             model_catalog_for=_model_catalog_for,
+            warm_catalogs=lambda: maintenance.start_manual("catalogs"),
+            catalog_fresh=lambda account_id: bool(catalog_cache.get(account_id)),
             account_router=account_router,
             async_client=http_client,
         )
@@ -1471,9 +1530,14 @@ exit /b %RC%
 
     if config.prewarm_catalogs:
         def _prewarm_catalogs() -> None:
+            # 逐个账号预热并留出间隔，避免服务一启动就对全部账号同时拉目录
+            previous = False
             for record in accounts.list():
                 if record.status != STATUS_ACTIVE:
                     continue
+                if previous:
+                    time.sleep(max(0, int(config.account_stagger_seconds)))
+                previous = True
                 try:
                     _model_catalog_for(record.id, False)
                 except Exception:

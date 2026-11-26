@@ -12,7 +12,7 @@ import json
 import logging
 import random
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -26,18 +26,20 @@ STATE_KEY = "maintenance_state"
 # 每小时一次的兜底检查：令牌剩余不足这个时间的账号立即刷新
 SAFETY_WINDOW = 6 * 3600
 MAX_SLOTS = 12
-# 每个任务对单个账号依次做什么
+# 每个任务对单个账号依次做什么。模型目录没有固定时刻，只按需在后台刷新。
 JOB_ACTIONS: dict[str, tuple[str, ...]] = {
     "token": ("token",),
     "keepalive": ("profile",),
     "credits": ("credits",),
     "sync": ("token", "profile", "credits"),
+    "catalogs": ("catalog",),
 }
 JOB_LABELS = {
     "token": "令牌刷新",
     "keepalive": "账号保活",
     "credits": "积分刷新",
     "sync": "全部刷新",
+    "catalogs": "模型目录",
 }
 SCHEDULED_JOBS = ("token", "keepalive", "credits")
 PROFILE_NAME_KEYS = ("ScreenName", "screenName", "NickName", "nickName", "Name")
@@ -234,6 +236,11 @@ class AccountMaintenance:
         self.transport = transport
         self._running: set[str] = set()
         self._manual: set[str] = set()
+        # 正在进行的任务已处理的账号数，给页面显示进度
+        self._progress: dict[str, int] = {}
+        # 模型目录的刷新入口和缓存由应用工厂在创建后接上
+        self.catalog_for: Optional[Callable[[str], Any]] = None
+        self.catalog_cache: Any = None
 
     # -- settings ---------------------------------------------------------
 
@@ -376,18 +383,22 @@ class AccountMaintenance:
             started.append("safety")
         return started
 
-    def start_manual(self, job: str) -> bool:
-        """在后台启动一轮手动任务；同一任务已在进行时返回 False。"""
+    def start_manual(self, job: str, *, force: bool = False) -> bool:
+        """在后台启动一轮手动任务；同一任务已在进行时返回 False。
+
+        ``force`` 用于模型目录：连仍在有效期内的账号也重新拉取。
+        """
         if job not in JOB_ACTIONS or job in self._running or job in self._manual:
             return False
         self._manual.add(job)
-        asyncio.get_running_loop().create_task(self._manual_run(job))
+        trigger = "force" if force else "manual"
+        asyncio.get_running_loop().create_task(self._manual_run(job, trigger))
         return True
 
-    async def _manual_run(self, job: str) -> None:
+    async def _manual_run(self, job: str, trigger: str) -> None:
         self._manual.discard(job)
         try:
-            await self.run(job, "manual")
+            await self.run(job, trigger)
         except Exception:
             logger.exception("manual %s failed", job)
 
@@ -395,11 +406,13 @@ class AccountMaintenance:
         """给全部启用账号各执行一遍，账号之间错峰。"""
         actions = JOB_ACTIONS[job]
         self._running.add(job)
+        self._progress[job] = 0
         started = int(time.time())
         try:
             items: list[dict[str, Any]] = []
             previous = False
             for record in self.order(self.active()):
+                self._progress[job] = len(items)
                 # 不需要发请求的账号直接记为跳过，不占用错峰间隔
                 noop = self._noop(actions, record, trigger)
                 if noop:
@@ -441,6 +454,7 @@ class AccountMaintenance:
         finally:
             # 结果保存之后才解除「进行中」，否则状态查询会看到既没在跑也没有结果
             self._running.discard(job)
+            self._progress.pop(job, None)
 
     @staticmethod
     def _item(record: Any, status: str, detail: str) -> dict[str, Any]:
@@ -455,6 +469,9 @@ class AccountMaintenance:
         """这一轮对这个账号是否完全不用请求上游；是的话返回跳过原因。"""
         if "token" in actions:
             return self._token_skip_reason(record, trigger)
+        if "catalog" in actions and trigger != "force" and self.catalog_cache is not None:
+            if self.catalog_cache.get(record.id):
+                return "目录仍在有效期内"
         return ""
 
     async def _act(
@@ -463,6 +480,8 @@ class AccountMaintenance:
         try:
             if action == "token":
                 return await self._token(record, trigger)
+            if action == "catalog":
+                return await self._catalog(record)
             secrets = self.accounts.get_secrets(record.id)
             if not secrets.token:
                 return "failed", "账号没有令牌"
@@ -485,6 +504,15 @@ class AccountMaintenance:
         if remaining > limit:
             return f"令牌还有 {remaining // 3600} 小时才到期"
         return ""
+
+    async def _catalog(self, record: Any) -> tuple[str, str]:
+        if self.catalog_for is None:
+            return "skipped", "模型目录刷新没有接入"
+        result = await asyncio.to_thread(self.catalog_for, record.id)
+        count = int(result.get("model_count") or 0) if isinstance(result, dict) else 0
+        if not count:
+            return "failed", "没有取到模型目录"
+        return "ok", f"目录已更新（{count} 个条目）"
 
     async def _token(self, record: Any, trigger: str) -> tuple[str, str]:
         force = trigger == "manual"
@@ -560,13 +588,18 @@ class AccountMaintenance:
     def status(self, now: Optional[dt.datetime] = None) -> dict[str, Any]:
         now = now or dt.datetime.now()
         last = self._state().get("last") or {}
+        total = len(self.active())
         jobs = {}
         for job, label in JOB_LABELS.items():
+            running = self.is_running(job)
             jobs[job] = {
                 "label": label,
                 "slots": self.slots(job) if job in SCHEDULED_JOBS else [],
                 "next_run": self.next_run(job, now) if job in SCHEDULED_JOBS else None,
-                "running": self.is_running(job),
+                "running": running,
+                "progress": {"done": self._progress.get(job, 0), "total": total}
+                if running
+                else None,
                 "last": last.get(job),
             }
         return {
