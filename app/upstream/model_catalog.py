@@ -515,9 +515,12 @@ def fetch_catalog(
                 entry = _ide_entry(raw, function, endpoint)
                 if not entry:
                     continue
-                if entry.reasoning_supported and not entry.reasoning_levels:
+                if entry.reasoning_supported:
                     hint = web_reasoning.get(entry.config_name)
                     if hint:
+                        # IDE 的 options 常常只剩 high 一项，官方 App 的完整档位
+                        # （lite / high / extra_high）只在 Web 目录里，所以档位
+                        # 一律以 Web 为准，不因 IDE 已有档位而跳过。
                         entry.reasoning_levels = list(hint.reasoning_levels)
                         entry.default_reasoning = hint.default_reasoning
                         entry.reasoning_source = "web_catalog"

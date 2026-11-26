@@ -1217,7 +1217,9 @@ def convert_messages(
                 if index == last_assistant_index and not has_calls
                 else ""
             )
-            if blocks or reasoning:
+            # 只有正文的 assistant 回合才发给上游：content 为空、仅带 reasoning
+            # 的消息会被上游判成非法参数（Empty content + reasoning）。
+            if blocks:
                 item: dict[str, Any] = {"role": "assistant", "content": blocks}
                 if reasoning:
                     # DeepSeek/agent upstreams may validate or use reasoning on
@@ -1435,6 +1437,23 @@ def resolve_model(
     return None
 
 
+# 目录里的档位是展示名，llm_raw_chat 线上只认 low / high / max：
+# light→low、extra_high→max，其余按原值发。
+WIRE_EFFORTS = {
+    "light": "low",
+    "lite": "low",
+    "minimal": "low",
+    "extra_high": "max",
+    "xhigh": "max",
+    "ultra": "max",
+}
+
+
+def wire_effort(level: str) -> str:
+    text = str(level or "").strip()
+    return WIRE_EFFORTS.get(text.lower(), text)
+
+
 def build_body(
     resolved: Mapping[str, Any],
     messages: list[Mapping[str, Any]],
@@ -1472,7 +1491,7 @@ def build_body(
         ),
     }
     if reasoning_effort:
-        body["reasoning_effort"] = reasoning_effort
+        body["reasoning_effort"] = wire_effort(reasoning_effort)
     return body
 
 

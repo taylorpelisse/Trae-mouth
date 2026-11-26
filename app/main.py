@@ -62,7 +62,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"
@@ -399,7 +399,9 @@ def _carry_web_catalog(
             hint = (old_models.get(str(model.get("config_name") or "")) or {}).get(
                 "reasoning"
             ) or {}
-            if reasoning.get("supported") and not reasoning.get("levels") and hint.get("levels"):
+            # IDE 自己给的档位常常不全（只剩 high），上次缓存里的 Web 档位更完整，
+            # 所以只要有能力声明就整段换成缓存的档位。
+            if reasoning.get("supported") and hint.get("levels"):
                 model["reasoning"] = dict(hint)
     result["model_count"] = sum(
         int(group.get("model_count") or 0)

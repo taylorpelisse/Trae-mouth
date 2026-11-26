@@ -81,6 +81,7 @@ _REASONING_RANKS = {
     "minimal": 0,
     "low": 0,
     "light": 0,
+    "lite": 0,
     "medium": 1,
     "high": 2,
     "xhigh": 3,
