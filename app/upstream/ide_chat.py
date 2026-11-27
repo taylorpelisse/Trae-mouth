@@ -1199,6 +1199,14 @@ def _completed_tool_call_reminder(messages: list[Mapping[str, Any]]) -> str:
     return text
 
 
+# 历史预算里留给头部（对话开头）的比例。头部不动，上游前缀缓存才有稳定
+# 的匹配起点；剩下的大头给最近的对话。
+HEAD_BUDGET_RATIO = 0.25
+# 预算小于这个量级时不做头部保留：那样只会挤掉更重要的近期对话。
+HEAD_MIN_CHARS = 8192
+HEAD_MIN_TOKENS = 4096
+
+
 def _compact_history(
     messages: list[Mapping[str, Any]],
     max_chars: int,
@@ -1272,10 +1280,43 @@ def _compact_history(
             max_prompt_tokens,
         )
 
+    # 头部固定：先按预算留住开头的若干条，剩下的预算再给尾部。
+    #
+    # 只从尾部反向累加时，历史一长窗口起点就逐轮前移，第一条用户消息跟着
+    # 变化，整个前缀每轮都不同，上游前缀缓存只剩系统提示词能命中。头部
+    # 留住不动，前缀就稳定，缓存才有意义。
+    kept_head: list[tuple[int, Mapping[str, Any]]] = []
+    head_chars = 0
+    head_tokens = 0
+    # 预算太小的时候不保留头部：挤掉的近期对话比省下的缓存更值钱
+    head_char_limit = (
+        int(remaining_chars * HEAD_BUDGET_RATIO)
+        if remaining_chars >= HEAD_MIN_CHARS
+        else 0
+    )
+    head_token_limit = (
+        int(remaining_tokens * HEAD_BUDGET_RATIO)
+        if remaining_tokens >= HEAD_MIN_TOKENS
+        else 0
+    )
+    if candidates and (head_char_limit > 0 or head_token_limit > 0):
+        for index, message in candidates:
+            count_reasoning = index == reasoning_index
+            size = _history_message_size(message, count_reasoning)
+            tokens = _history_message_tokens(message, count_reasoning)
+            if kept_head and (
+                (head_char_limit > 0 and head_chars + size > head_char_limit)
+                or (head_token_limit > 0 and head_tokens + tokens > head_token_limit)
+            ):
+                break
+            kept_head.append((index, message))
+            head_chars += size
+            head_tokens += tokens
+
     kept_reversed: list[tuple[int, Mapping[str, Any]]] = []
-    used_chars = 0
-    used_tokens = 0
-    for index, message in reversed(candidates):
+    used_chars = head_chars
+    used_tokens = head_tokens
+    for index, message in reversed(candidates[len(kept_head) :]):
         count_reasoning = index == reasoning_index
         size = _history_message_size(message, count_reasoning)
         tokens = _history_message_tokens(message, count_reasoning)
@@ -1287,7 +1328,7 @@ def _compact_history(
         kept_reversed.append((index, message))
         used_chars += size
         used_tokens += tokens
-    kept = list(reversed(kept_reversed))
+    kept = kept_head + list(reversed(kept_reversed))
 
     # If the window starts with a tool result, include the assistant call
     # immediately before it; if that call is unavailable, drop the orphan.
