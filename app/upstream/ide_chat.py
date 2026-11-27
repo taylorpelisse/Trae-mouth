@@ -111,6 +111,14 @@ _BARE_KV_RE = re.compile(
     r"(?P<key>[A-Za-z_][\w.\-]*)\s*=\s*"
     r"(?P<val>\"[^\"]*\"|'[^']*'|[^\s,;<>\"')\]]+)"
 )
+# glm-4.6 在 agent 通道的写法：
+#   <tool_call><name>run_command</name><args><command>echo hi</command></args></tool_call>
+# 参数用同名标签成对出现，<args> 有时省略。
+_TOOL_NAME_TAG_RE = re.compile(r"<name>\s*(?P<name>[^<>]+?)\s*</name>", re.I)
+_ARGS_TAG_RE = re.compile(r"<args>\s*(?P<body>.*?)\s*</args>", re.I | re.S)
+_TAG_PARAM_RE = re.compile(
+    r"<(?P<key>[A-Za-z_][\w.\-]*)>\s*(?P<val>.*?)\s*</(?P=key)>", re.S
+)
 # DSML blocks are located by _scan_dsml; these only flag the JSON-style markers.
 _NATIVE_OPEN_RES = (
     re.compile(r"<tool_call>", re.I),
@@ -447,6 +455,54 @@ def _parse_json_tool_calls(block: str) -> list[dict[str, Any]]:
     return calls
 
 
+def _parse_name_args_calls(block: str) -> list[dict[str, Any]]:
+    """解析 ``<name>x</name>`` + ``<args>`` 的成对标签写法。
+
+    glm-4.6 在 agent 通道会输出 ``<tool_call><name>run_command</name>
+    <args><command>echo hi</command></args></tool_call>``。参数块没闭合、
+    或参数块里解析不出任何键值时不返回调用——宁可当作截断，也不伪造一次
+    参数缺失的调用。
+    """
+
+    name_match = _TOOL_NAME_TAG_RE.search(block)
+    if not name_match:
+        return []
+    name = name_match.group("name").strip()
+    if not name:
+        return []
+    rest = block[name_match.end() :]
+    args_match = _ARGS_TAG_RE.search(rest)
+    if "<args" in rest.lower() and args_match is None:
+        return []
+    body = args_match.group("body") if args_match else rest
+    arguments: dict[str, Any] = {}
+    stripped = body.strip()
+    if stripped.startswith("{"):
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            return []
+        if isinstance(parsed, Mapping):
+            arguments = dict(parsed)
+    if not arguments:
+        for param in _XML_PARAM_RE.finditer(body):
+            key = (param.group("key1") or param.group("key2") or "").strip()
+            if not key:
+                continue
+            value = (
+                param.group("val1")
+                if param.group("val1") is not None
+                else param.group("val2")
+            )
+            arguments[key] = (value or "").strip("\n")
+    if not arguments:
+        for match in _TAG_PARAM_RE.finditer(body):
+            arguments[match.group("key")] = match.group("val").strip("\n")
+    if not arguments and args_match is not None:
+        return []
+    return [{"name": name, "arguments": arguments}]
+
+
 def _parse_xml_tool_calls(block: str) -> list[dict[str, Any]]:
     """解析 ``<function=X><parameter=Y>v</parameter></function>`` 形式的调用。
 
@@ -479,6 +535,9 @@ def _parse_xml_tool_calls(block: str) -> list[dict[str, Any]]:
         calls.append({"name": name, "arguments": arguments})
     if calls:
         return calls
+    named = _parse_name_args_calls(block)
+    if named:
+        return named
     # glm-5.3 的裸写法五花八门：
     #   <tool_call>read_file<path>v</parameter></function>
     #   <tool_call>read_file><parameter=path>v</parameter></function>
@@ -575,6 +634,8 @@ def detect_tool_format(text: str) -> str:
         return "doubao_json"
     if _XML_FUNC_OPEN_RE.search(text):
         return "xml_function"
+    if "<name>" in lowered and "<args" in lowered:
+        return "name_args"
     if "<tool_call>" in lowered:
         return "tool_call_block"
     return "none"

@@ -1303,6 +1303,40 @@ def test_recover_fenced_undeclared_name_is_suspicious() -> None:
     assert suspicious is True
 
 
+def test_tool_block_filter_parses_name_args_shape() -> None:
+    """glm-4.6 agent 通道：<name>x</name><args><k>v</k></args>。"""
+
+    text = (
+        "<tool_call>\n<name>run_command</name>\n<args>\n"
+        "<command>echo trae-native-tool-ok</command>\n</args>\n</tool_call>"
+    )
+    visible, calls = ide_chat.ToolBlockFilter().feed(text, final=True)
+    assert visible == ""
+    assert calls == [
+        {"name": "run_command", "arguments": {"command": "echo trae-native-tool-ok"}}
+    ]
+    assert ide_chat.detect_tool_format(text) == "name_args"
+
+
+def test_name_args_shape_without_args_tag_and_json_body() -> None:
+    bare = '<tool_call><name>Read</name><file_path>a.py</file_path></tool_call>'
+    visible, calls = ide_chat.ToolBlockFilter().feed(bare, final=True)
+    assert visible == ""
+    assert calls == [{"name": "Read", "arguments": {"file_path": "a.py"}}]
+
+    as_json = '<tool_call><name>Read</name><args>{"file_path": "b.py"}</args></tool_call>'
+    visible, calls = ide_chat.ToolBlockFilter().feed(as_json, final=True)
+    assert visible == ""
+    assert calls == [{"name": "Read", "arguments": {"file_path": "b.py"}}]
+
+
+def test_name_args_truncated_is_not_a_call() -> None:
+    text = "<tool_call><name>run_command</name><args><command>echo half"
+    visible, calls = ide_chat.ToolBlockFilter().feed(text, final=True)
+    assert visible == ""
+    assert calls == []
+
+
 def test_completed_call_reminder_uses_bridge_format() -> None:
     messages = [
         {"role": "user", "content": "读文件"},

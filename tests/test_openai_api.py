@@ -1463,6 +1463,24 @@ def test_translator_dropped_truncated_call_is_length_not_stop() -> None:
     assert _finish_reason_of(chunks) == "length"
 
 
+def test_translator_dropped_name_args_call_is_length_not_stop() -> None:
+    translator = OpenAIStreamTranslator("test-model", tools_expected=True)
+    translator.feed(
+        {
+            "event": "output",
+            "data": {
+                "response": (
+                    "先说一句\n<tool_call><name>run_command</name>"
+                    "<args><command>echo half"
+                )
+            },
+        }
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    chunks = translator.finalize()
+    assert _finish_reason_of(chunks) == "length"
+
+
 def test_translator_streams_plain_text_without_marker_overhead() -> None:
     translator = OpenAIStreamTranslator("test-model", tools_expected=True)
     text = "编译完成，下面开始测试。" * 10
