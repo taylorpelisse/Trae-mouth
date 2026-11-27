@@ -65,6 +65,8 @@ export type AdminLog = {
   first_token_ms: number;
   total_ms: number;
   credits: number | null;
+  /** 账单回查得到的缓存命中 token 数；0 表示未命中或还没查到 */
+  cached_tokens: number;
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
@@ -88,6 +90,8 @@ export type AdminModel = {
   max_mode: boolean;
   account_count: number;
   provider_models: string[];
+  /** Trae 目录里的计费倍率；目录没给时为 null */
+  usage_cost: number | null;
 };
 
 export type AdminSettings = {
@@ -148,6 +152,12 @@ export type DashboardMetrics = {
     total_tokens: number;
     prompt_tokens: number;
     completion_tokens: number;
+    /** 账单回查得到的缓存命中 token 合计 */
+    cached_tokens: number;
+    /** 缓存命中率，百分比（0-100） */
+    cache_hit_rate: number;
+    /** 账单回查得到的真实扣费合计 */
+    credits: number;
     avg_first_token_ms: number;
     success_rate: number;
   };
@@ -155,12 +165,17 @@ export type DashboardMetrics = {
     requests: number;
     tokens: number;
     errors: number;
+    cached_tokens: number;
+    /** 今日真实消耗，逐请求账单累计 */
+    credits: number;
   };
   trend: {
     day: string;
     requests: number;
     errors: number;
     total_tokens: number;
+    cached_tokens: number;
+    credits: number;
   }[];
   credits: {
     available: number | null;

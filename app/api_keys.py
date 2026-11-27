@@ -265,14 +265,18 @@ class ApiKeyStore:
         client: str = "",
         reasoning_effort: str = "",
         context_window: int = 0,
+        cached_tokens: int = 0,
+        credits: float = 0.0,
+        conversation_key: str = "",
     ) -> None:
         with self.db.tx() as conn:
             conn.execute(
                 "INSERT INTO usage_events(request_id, api_key_id, account_id, model, "
                 "endpoint, status, prompt_tokens, completion_tokens, total_tokens, "
                 "first_token_ms, latency_ms, error, source_ip, client, "
-                "reasoning_effort, context_window, created_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "reasoning_effort, context_window, cached_tokens, credits, "
+                "conversation_key, created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     request_id,
                     api_key_id,
@@ -290,9 +294,94 @@ class ApiKeyStore:
                     str(client or "")[:64],
                     str(reasoning_effort or "")[:32],
                     int(context_window or 0),
+                    int(cached_tokens or 0),
+                    float(credits or 0.0),
+                    str(conversation_key or "")[:200],
                     now_ts(),
                 ),
             )
+
+    def attach_billing(
+        self, request_id: str, *, cached_tokens: int = 0, credits: float = 0.0
+    ) -> None:
+        """把账单回查的结果补到已记录的那条用量上。
+
+        同时标记 billing_ok：命中率统计只算查到的行，否则"查不到"会被
+        当成"没命中"，把整体命中率拉低。
+        """
+
+        if not request_id:
+            return
+        with self.db.tx() as conn:
+            conn.execute(
+                "UPDATE usage_events SET cached_tokens = ?, credits = ?, "
+                "billing_ok = 1 WHERE request_id = ?",
+                (int(cached_tokens or 0), float(credits or 0.0), request_id),
+            )
+
+    def settle_billing(
+        self,
+        session_id: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cached_tokens: int = 0,
+        credits: float = 0.0,
+    ) -> dict[str, float]:
+        """把账单的会话累计值换算成本次请求的增量。
+
+        账单接口按会话返回累计用量，直接记录会让同一会话的每个请求都记一遍
+        总额。这里记住上一次的累计值，只返回这次新增的部分。
+        """
+
+        if not session_id:
+            return {"cached_tokens": float(cached_tokens), "credits": float(credits)}
+        now = now_ts()
+        with self.db.tx() as conn:
+            row = conn.execute(
+                "SELECT input_tokens, output_tokens, cached_tokens, credits "
+                "FROM billing_state WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            previous = (
+                dict(row)
+                if row is not None
+                else {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cached_tokens": 0,
+                    "credits": 0.0,
+                }
+            )
+            conn.execute(
+                "INSERT INTO billing_state(session_id, input_tokens, output_tokens, "
+                "cached_tokens, credits, updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "input_tokens=excluded.input_tokens, "
+                "output_tokens=excluded.output_tokens, "
+                "cached_tokens=excluded.cached_tokens, "
+                "credits=excluded.credits, updated_at=excluded.updated_at",
+                (
+                    session_id,
+                    int(input_tokens or 0),
+                    int(output_tokens or 0),
+                    int(cached_tokens or 0),
+                    float(credits or 0.0),
+                    now,
+                ),
+            )
+        return {
+            "input_tokens": max(
+                0, int(input_tokens or 0) - int(previous["input_tokens"] or 0)
+            ),
+            "cached_tokens": max(
+                0, int(cached_tokens or 0) - int(previous["cached_tokens"] or 0)
+            ),
+            "credits": max(
+                0.0,
+                round(float(credits or 0.0) - float(previous["credits"] or 0.0), 4),
+            ),
+        }
 
     def events(
         self,

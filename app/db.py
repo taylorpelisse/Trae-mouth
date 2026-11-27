@@ -212,6 +212,16 @@ CREATE TABLE IF NOT EXISTS model_catalog_snapshot (
     fetched_at INTEGER NOT NULL,
     account_id TEXT NOT NULL DEFAULT ''
 );
+
+-- 账单接口按会话累计返回，这里记住上一次的累计值，用来算每次请求的增量
+CREATE TABLE IF NOT EXISTS billing_state (
+    session_id TEXT PRIMARY KEY,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    credits REAL NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
 """
 
 DEVICE_COLUMNS = {
@@ -251,6 +261,13 @@ USAGE_COLUMNS = {
     "client": "TEXT NOT NULL DEFAULT ''",
     "reasoning_effort": "TEXT NOT NULL DEFAULT ''",
     "context_window": "INTEGER NOT NULL DEFAULT 0",
+    # 账单回查补上的真实数据：流式事件不报缓存命中，只有账单里有
+    "cached_tokens": "INTEGER NOT NULL DEFAULT 0",
+    "credits": "REAL NOT NULL DEFAULT 0",
+    # 账单是否查到了。查不到时 cached/credits 是 0，不能当成"没命中"统计
+    "billing_ok": "INTEGER NOT NULL DEFAULT 0",
+    # 请求所属对话，用来统计单个对话累计消耗了多少积分
+    "conversation_key": "TEXT NOT NULL DEFAULT ''",
 }
 
 

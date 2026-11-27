@@ -44,6 +44,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env(name, str(default)))
+    except ValueError:
+        return default
+
+
 def _decode_key(raw: str) -> bytes:
     raw = raw.strip()
     if not raw:
@@ -125,6 +132,10 @@ class Config:
     conversation_affinity_ttl: int = 7 * 86400
     account_failover_limit: int = 2
     account_cooldown: int = 120
+    # 对话粘性轮转：空闲超过这么久、或本对话消耗已占该账号两成，
+    # 就允许换号。实测缓存能活 9 小时以上，所以空闲阈值给得很宽。
+    account_rotation_idle_seconds: int = 1800
+    account_rotation_credit_share: float = 0.2
     # 目录快照已经落库，重启不需要重新拉；只在完全没有快照时后台补一次
     prewarm_catalogs: bool = True
     max_request_bytes: int = 128 * 1024 * 1024
@@ -147,6 +158,8 @@ class Config:
     trae_web_origin: str = "https://solo.trae.cn"
     model_gateway: str = "https://trae-api-cn.mchost.guru"
     web_api_base: str = "https://trae-api-cn.mchost.guru/api/remote/v1"
+    # 用量账单接口独立域名：流式事件不报缓存命中，只能从这里回查
+    usage_api_host: str = "https://api5-normal.mchost.guru"
     login_plugin_version: str = "2.3.24254"
     login_app_version: str = "0.1.7"
     native_app_version: str = "2.3.105403"
@@ -213,6 +226,12 @@ class Config:
                 "TRAE_MOUTH_ACCOUNT_FAILOVER_LIMIT", 2
             ),
             account_cooldown=_env_int("TRAE_MOUTH_ACCOUNT_COOLDOWN", 120),
+            account_rotation_idle_seconds=_env_int(
+                "TRAE_MOUTH_ROTATION_IDLE_SECONDS", 1800
+            ),
+            account_rotation_credit_share=_env_float(
+                "TRAE_MOUTH_ROTATION_CREDIT_SHARE", 0.2
+            ),
             prewarm_catalogs=_env_bool("TRAE_MOUTH_PREWARM_CATALOGS", True),
             max_request_bytes=_env_int(
                 "TRAE_MOUTH_MAX_REQUEST_BYTES", 128 * 1024 * 1024
@@ -229,6 +248,9 @@ class Config:
             web_api_base=_env(
                 "TRAE_WEB_API_BASE",
                 "https://trae-api-cn.mchost.guru/api/remote/v1",
+            ),
+            usage_api_host=_env(
+                "TRAE_USAGE_API_HOST", "https://api5-normal.mchost.guru"
             ),
             login_plugin_version=_env("TRAE_LOGIN_PLUGIN_VERSION", "2.3.24254"),
             login_app_version=_env("TRAE_LOGIN_APP_VERSION", "0.1.7"),

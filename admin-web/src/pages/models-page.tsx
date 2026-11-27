@@ -241,7 +241,7 @@ export function ModelsPage() {
         <div className="overflow-hidden rounded-card border border-border bg-card">
           <Table className="table-fixed">
             <colgroup>
-              {["20%", "10%", "10%", "10%", "20%", "10%", "10%", "10%"].map(
+              {["28%", "7%", "8%", "8%", "22%", "6%", "7%", "7%", "7%"].map(
                 (width, index) => (
                   <col key={index} style={{ width }} />
                 ),
@@ -249,7 +249,7 @@ export function ModelsPage() {
             </colgroup>
             <TableHeader>
               <TableRow>
-                {["模型 ID", "上下文", "最大输出", "prompt 上限", "推理档位", "视觉", "原生工具", "1M"].map(
+                {["模型 ID", "上下文", "最大输出", "prompt 上限", "推理档位", "视觉", "原生工具", "1M", "倍率"].map(
                   (label) => (
                     <TableHead key={label} className="text-center">
                       {label}
@@ -312,6 +312,9 @@ export function ModelsPage() {
                     </TableCell>
                     <TableCell className="text-center">
                       {model.max_mode ? <Badge variant="accent">1M</Badge> : "—"}
+                    </TableCell>
+                    <TableCell className="text-center tabular-nums">
+                      {model.usage_cost ? `×${model.usage_cost}` : "—"}
                     </TableCell>
                   </TableRow>
                 );

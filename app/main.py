@@ -62,7 +62,7 @@ from .upstream import catalog
 from .upstream import model_catalog
 
 logger = logging.getLogger("trae_mouth")
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 SESSION_COOKIE = "tm_session"
 CSRF_COOKIE = "tm_csrf"
@@ -585,6 +585,8 @@ def create_app(
         accounts,
         affinity_ttl=config.conversation_affinity_ttl,
         cooldown=config.account_cooldown,
+        rotation_idle_seconds=config.account_rotation_idle_seconds,
+        rotation_credit_share=config.account_rotation_credit_share,
     )
     app.state.account_router = account_router
 

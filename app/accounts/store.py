@@ -165,6 +165,48 @@ class AccountStore:
             return None
         return str(row["account_id"])
 
+    def conversation_affinity(
+        self, conversation_key: str
+    ) -> Optional[tuple[str, int]]:
+        """返回绑定的账号和最后活跃时间；没有绑定时返回 None。"""
+
+        if not conversation_key:
+            return None
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT account_id, updated_at FROM conversation_accounts "
+                "WHERE conversation_key = ?",
+                (conversation_key,),
+            ).fetchone()
+        if not row:
+            return None
+        return str(row["account_id"]), int(row["updated_at"])
+
+    def conversation_credits(self, conversation_key: str, account_id: str) -> float:
+        """这个对话在该账号上已经消耗的积分合计。"""
+
+        if not conversation_key or not account_id:
+            return 0.0
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(credits), 0) FROM usage_events "
+                "WHERE conversation_key = ? AND account_id = ?",
+                (conversation_key, account_id),
+            ).fetchone()
+        return float(row[0] or 0) if row else 0.0
+
+    def account_credit_balance(self, account_id: str) -> Optional[float]:
+        """账号最近一次记录的积分余额；没有记录时返回 None。"""
+
+        if not account_id:
+            return None
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT balance FROM credit_balance WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        return float(row["balance"]) if row else None
+
     def bind_conversation_account(
         self, conversation_key: str, account_id: str, *, purge_before: int = 0
     ) -> None:

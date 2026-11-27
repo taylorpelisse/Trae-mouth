@@ -235,14 +235,14 @@ export function LogsPage() {
       </div>
 
       {logsQuery.isLoading ? (
-        <TableSkeleton columns={12} rows={8} />
+        <TableSkeleton columns={13} rows={8} />
       ) : logs.length === 0 ? (
         <EmptyState title="暂无日志" description="当前筛选条件下没有日志记录。" />
       ) : (
         <div className="overflow-hidden rounded-card border border-border bg-card">
           <Table className="table-fixed [&_td]:py-2">
             <colgroup>
-              {["15%", "4%", "8%", "10%", "17%", "9%", "5%", "6%", "6%", "4%", "12%", "4%"].map(
+              {["15%", "4%", "7%", "10%", "16%", "9%", "7%", "7%", "5%", "7%", "13%", "4%"].map(
                 (width, index) => (
                   <col key={index} style={{ width }} />
                 ),
@@ -257,10 +257,10 @@ export function LogsPage() {
                   "账号",
                   "模型",
                   "思考等级",
-                  "上下文",
                   "首字",
                   "耗时",
                   "积分",
+                  "缓存",
                   "输入/输出",
                   "更多",
                 ].map((label) => (
@@ -285,15 +285,17 @@ export function LogsPage() {
                   </TableCell>
                   <TableCell className="truncate text-center text-xs">{log.model || "—"}</TableCell>
                   <TableCell className="text-center text-xs">{log.reasoning_effort || "—"}</TableCell>
-                  <TableCell className="text-center text-xs">
-                    {log.context_window ? formatContext(log.context_window) : "—"}
-                  </TableCell>
                   <TableCell className="text-center text-xs">{formatDuration(log.first_token_ms)}</TableCell>
                   <TableCell className="text-center text-xs">{formatDuration(log.total_ms)}</TableCell>
                   <TableCell className="text-center text-xs">
                     {log.credits === null || log.credits === undefined
                       ? "—"
                       : formatNumber(log.credits)}
+                  </TableCell>
+                  <TableCell className="text-center text-xs text-muted">
+                    {log.cached_tokens && log.prompt_tokens
+                      ? `${((log.cached_tokens / log.prompt_tokens) * 100).toFixed(1)}%`
+                      : "—"}
                   </TableCell>
                   <TableCell className="text-center text-xs">
                     {formatTokenCount(log.prompt_tokens)} /{" "}
@@ -343,6 +345,22 @@ export function LogsPage() {
                   ["总耗时", formatDuration(selectedLog.total_ms)],
                   ["输入 Token", formatTokenCount(selectedLog.prompt_tokens)],
                   ["输出 Token", formatTokenCount(selectedLog.completion_tokens)],
+                  [
+                    "缓存命中率",
+                    selectedLog.cached_tokens && selectedLog.prompt_tokens
+                      ? `${(
+                          (selectedLog.cached_tokens / selectedLog.prompt_tokens) *
+                          100
+                        ).toFixed(1)}%`
+                      : "—",
+                  ],
+                  [
+                    "真实扣费",
+                    selectedLog.credits === null ||
+                    selectedLog.credits === undefined
+                      ? "—"
+                      : formatNumber(selectedLog.credits),
+                  ],
                   ["错误", selectedLog.error_code || "—"],
                 ].map(([label, value]) => (
                   <div

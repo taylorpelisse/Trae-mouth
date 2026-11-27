@@ -307,10 +307,14 @@ def test_chat_session_id_is_stable_per_conversation(config) -> None:
         first_session = first.json()["trae"]["session_id"]
         second_session = second.json()["trae"]["session_id"]
         other_session = other.json()["trae"]["session_id"]
+        # 对外暴露的会话 id 按对话稳定，客户端据此做粘性
         assert first_session == second_session
         assert other_session != first_session
-        assert seen[0]["conversation_id"] == seen[1]["conversation_id"]
+        # 发给上游的会话 id 每次请求都不同：账单按会话结算，
+        # 共用一个 id 只能拿到累计值，算不出单次成本
+        assert seen[0]["conversation_id"] != seen[1]["conversation_id"]
         assert seen[2]["conversation_id"] != seen[0]["conversation_id"]
+        assert seen[0]["conversation_id"] and seen[1]["conversation_id"]
 
         explicit = "11111111-1111-4111-8111-111111111111"
         explicit_response = client.post(
@@ -323,7 +327,7 @@ def test_chat_session_id_is_stable_per_conversation(config) -> None:
         )
         assert explicit_response.status_code == 200
         assert explicit_response.json()["trae"]["session_id"] == explicit
-        assert seen[3]["conversation_id"] == explicit
+        assert seen[3]["conversation_id"] != explicit
 
 
 def test_chat_truncated_tool_call_reports_error(config) -> None:

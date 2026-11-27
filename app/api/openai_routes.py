@@ -18,7 +18,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict
 
 from ..accounts.router import AccountRouter
-from ..upstream import ide_chat, model_catalog, web_chat
+from ..upstream import activity, ide_chat, model_catalog, web_chat
 from ..upstream.ide_chat import (
     TextAccumulator,
     ToolBlockFilter,
@@ -905,6 +905,8 @@ def create_openai_router(
             accounts,
             affinity_ttl=config.conversation_affinity_ttl,
             cooldown=config.account_cooldown,
+            rotation_idle_seconds=config.account_rotation_idle_seconds,
+            rotation_credit_share=config.account_rotation_credit_share,
         )
 
     def request_ip(request: Request) -> str:
@@ -1099,6 +1101,7 @@ def create_openai_router(
         client: str = "",
         reasoning_effort: str = "",
         context_window: int = 0,
+        conversation_key: str = "",
     ) -> None:
         payload = usage if isinstance(usage, Mapping) else {}
         prompt_tokens = int(payload.get("prompt_tokens") or 0)
@@ -1125,6 +1128,7 @@ def create_openai_router(
                 client=client,
                 reasoning_effort=reasoning_effort,
                 context_window=context_window,
+                conversation_key=conversation_key,
             )
             api_keys.record_usage(
                 auth.key_id,
@@ -1134,6 +1138,69 @@ def create_openai_router(
             )
         except Exception:
             logger.exception("failed to record api usage")
+
+    async def _lookup_billing(
+        token: str,
+        session_id: str,
+        request_id: str,
+        prompt_tokens: int = 0,
+        delay: float = 6.0,
+    ) -> None:
+        """延迟回查真实账单。
+
+        流式事件里的缓存计数恒为 0（上游不报），只有账单接口有真实值。
+        账单按会话累计，且结算有延迟，所以必须核对增量：只有这次新增的输入
+        与本次请求的 prompt 对得上才采信，否则宁可不记也不写错数。
+        """
+
+        try:
+            await asyncio.sleep(delay)
+            result = await activity.session_usage(config, token, session_id)
+            if not result.get("ok"):
+                return
+            data = result.get("data") or {}
+            delta = api_keys.settle_billing(
+                session_id,
+                input_tokens=int(data.get("input_tokens") or 0),
+                output_tokens=int(data.get("output_tokens") or 0),
+                cached_tokens=int(data.get("cached_tokens") or 0),
+                credits=float(data.get("credits") or 0.0),
+            )
+            added_input = int(delta.get("input_tokens") or 0)
+            if prompt_tokens > 0 and added_input > 0:
+                # 增量与本轮 prompt 差太远，说明账上混进了别的请求
+                if abs(added_input - prompt_tokens) > max(256, prompt_tokens // 5):
+                    logger.debug(
+                        "billing delta mismatch: bill=%d prompt=%d",
+                        added_input,
+                        prompt_tokens,
+                    )
+                    return
+            cached = int(delta.get("cached_tokens") or 0)
+            if prompt_tokens > 0:
+                # 缓存命中不可能超过输入本身
+                cached = min(cached, prompt_tokens)
+            api_keys.attach_billing(
+                request_id,
+                cached_tokens=cached,
+                credits=float(delta.get("credits") or 0.0),
+            )
+        except Exception:
+            logger.debug("billing lookup failed", exc_info=True)
+
+    def _schedule_billing(
+        token: str, session_id: str, request_id: str, prompt_tokens: int = 0
+    ) -> None:
+        """后台补查账单；只在有会话 id 的成功请求上做。"""
+
+        if not session_id or not token:
+            return
+        try:
+            asyncio.get_running_loop().create_task(
+                _lookup_billing(token, session_id, request_id, prompt_tokens)
+            )
+        except RuntimeError:
+            pass
 
     @router.post("/v1/chat/completions")
     async def chat_completions(
@@ -1163,7 +1230,13 @@ def create_openai_router(
             _, payload.model = ide_chat.parse_model_channel(payload.model)
             channel = "ide"
         requested_effort = str(payload.reasoning_effort or "").strip()
-        preferred = requested_account or account_router.affinity(conversation_key) or ""
+        # 显式指定账号优先；否则用对话绑定，但空闲太久或已吃掉该账号
+        # 两成额度时会放弃绑定，交给下面的选号重新分配
+        preferred = (
+            requested_account
+            or account_router.affinity_or_rotate(conversation_key)
+            or ""
+        )
         active = account_router.active()
         if not active:
             _record_usage(
@@ -1266,6 +1339,10 @@ def create_openai_router(
                         + conversation_key,
                     )
                 )
+            # 上游会话 id 每次请求独立。账单接口按会话结算，共用一个 id 时
+            # 只能拿到累计值，算不出单次请求的真实成本；实测换 id 不影响
+            # 模型绑定，也不影响工具循环（工具结果靠重发历史传递）。
+            upstream_session_id = str(uuid.uuid4())
 
             account_router.acquire(record.id)
             stream: Optional[AsyncIterator[dict[str, Any]]] = None
@@ -1306,7 +1383,7 @@ def create_openai_router(
                         tools=payload.tools,
                         tool_choice=payload.tool_choice,
                         parallel_tool_calls=payload.parallel_tool_calls,
-                        session_id=session_id,
+                        session_id=upstream_session_id,
                         reasoning_effort=effective_effort,
                         max_tool_result_chars=int(config.tool_result_max_chars or 0),
                         max_history_chars=int(config.history_max_chars or 0),
@@ -1428,7 +1505,15 @@ def create_openai_router(
                         client=client_name,
                         reasoning_effort=effective_effort,
                         context_window=context_window,
+                        conversation_key=conversation_key,
                     )
+                    if not web:
+                        _schedule_billing(
+                            secrets.token,
+                            upstream_session_id,
+                            request_id,
+                            int((result.get("usage") or {}).get("prompt_tokens") or 0),
+                        )
                     return result
 
                 try:
@@ -1538,7 +1623,20 @@ def create_openai_router(
                                 client=client_name,
                                 reasoning_effort=effective_effort,
                                 context_window=context_window,
+                                conversation_key=conversation_key,
                             )
+                            if not web and status_code == 200:
+                                _schedule_billing(
+                                    secrets.token,
+                                    upstream_session_id,
+                                    request_id,
+                                    int(
+                                        (translator.usage or {}).get(
+                                            "prompt_tokens"
+                                        )
+                                        or 0
+                                    ),
+                                )
 
                 headers = {
                     "Cache-Control": "no-cache",

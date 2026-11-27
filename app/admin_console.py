@@ -208,11 +208,19 @@ def create_admin_console_router(
                 "total_tokens": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
+                "cached_tokens": 0,
+                "credits": 0.0,
+                "billed_cached": 0,
+                "billed_prompt": 0,
+                "billed_count": 0,
                 "first_token_total": 0,
                 "first_token_count": 0,
             }
             for label in labels
         }
+        # 缓存命中率只统计账单查到的行：查不到时 cached 记 0，
+        # 混进分母会把命中率拉低成假的
+        billed = "billing_ok = 1 AND prompt_tokens > 0"
         with db.read() as conn:
             rows = conn.execute(
                 "SELECT date(created_at, 'unixepoch', 'localtime') AS day, "
@@ -221,6 +229,11 @@ def create_admin_console_router(
                 "SUM(total_tokens) AS total_tokens, "
                 "SUM(prompt_tokens) AS prompt_tokens, "
                 "SUM(completion_tokens) AS completion_tokens, "
+                "SUM(cached_tokens) AS cached_tokens, "
+                "SUM(credits) AS credits, "
+                f"SUM(CASE WHEN {billed} THEN cached_tokens ELSE 0 END) AS billed_cached, "
+                f"SUM(CASE WHEN {billed} THEN prompt_tokens ELSE 0 END) AS billed_prompt, "
+                f"SUM(CASE WHEN {billed} THEN 1 ELSE 0 END) AS billed_count, "
                 "SUM(CASE WHEN first_token_ms > 0 THEN first_token_ms ELSE 0 END) AS ft_total, "
                 "SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END) AS ft_count "
                 "FROM usage_events WHERE created_at >= ? GROUP BY day",
@@ -229,7 +242,12 @@ def create_admin_console_router(
             today_row = conn.execute(
                 "SELECT COUNT(*) AS requests, "
                 "SUM(CASE WHEN status >= 400 THEN 1 ELSE 0 END) AS errors, "
-                "SUM(total_tokens) AS total_tokens "
+                "SUM(total_tokens) AS total_tokens, "
+                "SUM(cached_tokens) AS cached_tokens, "
+                "SUM(credits) AS credits, "
+                f"SUM(CASE WHEN {billed} THEN cached_tokens ELSE 0 END) AS billed_cached, "
+                f"SUM(CASE WHEN {billed} THEN prompt_tokens ELSE 0 END) AS billed_prompt, "
+                f"SUM(CASE WHEN {billed} THEN 1 ELSE 0 END) AS billed_count "
                 "FROM usage_events WHERE date(created_at, 'unixepoch', 'localtime') = ?",
                 (dt.date.today().isoformat(),),
             ).fetchone()
@@ -242,6 +260,11 @@ def create_admin_console_router(
             item["total_tokens"] = int(row["total_tokens"] or 0)
             item["prompt_tokens"] = int(row["prompt_tokens"] or 0)
             item["completion_tokens"] = int(row["completion_tokens"] or 0)
+            item["cached_tokens"] = int(row["cached_tokens"] or 0)
+            item["credits"] = round(float(row["credits"] or 0), 4)
+            item["billed_cached"] = int(row["billed_cached"] or 0)
+            item["billed_prompt"] = int(row["billed_prompt"] or 0)
+            item["billed_count"] = int(row["billed_count"] or 0)
             item["first_token_total"] = int(row["ft_total"] or 0)
             item["first_token_count"] = int(row["ft_count"] or 0)
         trend = []
@@ -257,6 +280,8 @@ def create_admin_console_router(
                     "requests": item["requests"],
                     "errors": item["errors"],
                     "total_tokens": item["total_tokens"],
+                    "cached_tokens": item["cached_tokens"],
+                    "credits": item["credits"],
                 }
             )
         total_requests = sum(item["requests"] for item in series.values())
@@ -264,6 +289,12 @@ def create_admin_console_router(
         total_tokens = sum(item["total_tokens"] for item in series.values())
         prompt_tokens = sum(item["prompt_tokens"] for item in series.values())
         completion_tokens = sum(item["completion_tokens"] for item in series.values())
+        cached_tokens = sum(item["cached_tokens"] for item in series.values())
+        total_credits = round(sum(item["credits"] for item in series.values()), 4)
+        # 命中率的分母只用账单查到的行
+        billed_prompt = sum(item["billed_prompt"] for item in series.values())
+        billed_cached = sum(item["billed_cached"] for item in series.values())
+        billed_count = sum(item["billed_count"] for item in series.values())
         records = accounts.list()
         now = now_ts()
         active = sum(1 for row in records if row.status == STATUS_ACTIVE)
@@ -310,6 +341,16 @@ def create_admin_console_router(
                 "total_tokens": total_tokens,
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
+                "cached_tokens": cached_tokens,
+                # 命中率只按账单查到的行算；查不到的行 cached 记 0，
+                # 混进分母会得出偏低的假命中率
+                "cache_hit_rate": (
+                    round(billed_cached / billed_prompt * 100, 2)
+                    if billed_prompt
+                    else 0
+                ),
+                "billed_requests": billed_count,
+                "credits": total_credits,
                 "avg_first_token_ms": (
                     round(total_first / total_first_count, 1)
                     if total_first_count
@@ -325,13 +366,22 @@ def create_admin_console_router(
                 "requests": int(today_row["requests"] or 0) if today_row else 0,
                 "tokens": int(today_row["total_tokens"] or 0) if today_row else 0,
                 "errors": int(today_row["errors"] or 0) if today_row else 0,
+                "cached_tokens": (
+                    int(today_row["cached_tokens"] or 0) if today_row else 0
+                ),
+                # 今日真实消耗：逐请求账单回查的累计，比按余额差推算准确
+                "credits": (
+                    round(float(today_row["credits"] or 0), 4) if today_row else 0.0
+                ),
             },
             "trend": trend,
             "credits": {
                 "available": None,
-                "used_today": None,
+                "used_today": (
+                    round(float(today_row["credits"] or 0), 4) if today_row else 0.0
+                ),
                 "changed": None,
-                "supported": False,
+                "supported": True,
             },
             "upstream": {
                 "status": "正常" if active else "异常",
@@ -403,6 +453,9 @@ def create_admin_console_router(
                             "max_mode": False,
                             "account_count": 0,
                             "provider_models": [],
+                            # Trae 目录里的计费倍率（model_entitlement_usage_cost
+                            # 或 Web 目录的 consumption_rate），没有时为 None
+                            "usage_cost": None,
                             "_accounts": set(),
                         },
                     )
@@ -412,6 +465,10 @@ def create_admin_console_router(
                         value = entry.get(field)
                         if isinstance(value, (int, float)):
                             item[field] = max(item[field] or 0, int(value))
+                    cost = entry.get("usage_cost")
+                    if isinstance(cost, (int, float)) and cost > 0:
+                        # 同一模型可能出现在多个通道，取最大的那个倍率
+                        item["usage_cost"] = max(item["usage_cost"] or 0, float(cost))
                     for variant in entry.get("variants") or []:
                         if not isinstance(variant, dict):
                             continue
@@ -521,7 +578,17 @@ def create_admin_console_router(
                     ),
                     "first_token_ms": int(row["first_token_ms"] or 0),
                     "total_ms": int(row["latency_ms"] or 0),
-                    "credits": None,
+                    # 账单回查补上的真实值：0 表示还没查到或确实没有
+                    "credits": (
+                        round(float(row["credits"]), 4)
+                        if "credits" in row.keys() and row["credits"]
+                        else None
+                    ),
+                    "cached_tokens": (
+                        int(row["cached_tokens"] or 0)
+                        if "cached_tokens" in row.keys()
+                        else 0
+                    ),
                     "prompt_tokens": int(row["prompt_tokens"] or 0),
                     "completion_tokens": int(row["completion_tokens"] or 0),
                     "total_tokens": int(row["total_tokens"] or 0),
@@ -602,14 +669,19 @@ def create_admin_console_router(
         income = {label: 0.0 for label in labels}
         expense = {label: 0.0 for label in labels}
         with db.read() as conn:
+            # 支出用逐请求账单回查的真实扣费，比按每日余额差推算准确：
+            # 余额差受签到、充值、并发请求影响，算不准单日消耗。
             rows = conn.execute(
-                "SELECT day, SUM(MAX(latest - baseline, 0)) AS amount "
-                "FROM credit_daily WHERE day >= ? GROUP BY day",
-                (start.isoformat(),),
+                "SELECT date(created_at, 'unixepoch', 'localtime') AS day, "
+                "SUM(credits) AS amount FROM usage_events "
+                "WHERE created_at >= ? GROUP BY day",
+                (int(time.time()) - (today - start).days * 86400,),
             ).fetchall()
             for row in rows:
                 if str(row["day"]) in expense:
-                    expense[str(row["day"])] = float(row["amount"] or 0)
+                    expense[str(row["day"])] = round(
+                        float(row["amount"] or 0), 4
+                    )
             rows = conn.execute(
                 "SELECT date(created_at, 'unixepoch', 'localtime') AS day, "
                 "SUM(amount) AS amount FROM credit_events "

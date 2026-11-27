@@ -202,13 +202,9 @@ export function DashboardPage() {
         />
         <StatCard
           label="今日已用"
-          loading={credits.isLoading}
-          value={
-            credits.data?.today_used === null || credits.data?.today_used === undefined
-              ? "—"
-              : formatNumber(credits.data.today_used)
-          }
-          hint="今日消耗积分"
+          loading={metrics.isLoading}
+          value={formatNumber(today?.credits ?? 0)}
+          hint="逐请求账单累计的真实扣费"
           icon={<Activity className="h-4 w-4" />}
         />
         <StatCard
@@ -263,10 +259,19 @@ export function DashboardPage() {
                         <stop offset="0%" stopColor="#15803D" stopOpacity={0.28} />
                         <stop offset="100%" stopColor="#15803D" stopOpacity={0.02} />
                       </linearGradient>
+                      <linearGradient id="tm-error" x1="0" y1="0" x2="0" y2="1">
+                        <stop offset="0%" stopColor="#DC2626" stopOpacity={0.3} />
+                        <stop offset="100%" stopColor="#DC2626" stopOpacity={0.02} />
+                      </linearGradient>
                     </defs>
                     <CartesianGrid strokeDasharray="3 3" stroke="#E3EBE6" vertical={false} />
                     <XAxis dataKey="day" tick={{ fontSize: 11, fill: "#74807A" }} tickLine={false} axisLine={false} />
-                    <YAxis tick={{ fontSize: 11, fill: "#74807A" }} tickLine={false} axisLine={false} allowDecimals={false} />
+                    <YAxis
+                      tick={{ fontSize: 11, fill: "#74807A" }}
+                      tickLine={false}
+                      axisLine={false}
+                      allowDecimals={false}
+                    />
                     <ChartTooltip
                       contentStyle={{
                         borderRadius: 16,
@@ -277,19 +282,18 @@ export function DashboardPage() {
                     <Area
                       type="monotone"
                       dataKey="requests"
-                      name="成功"
+                      name="调用"
                       stroke="#15803D"
                       strokeWidth={2}
                       fill="url(#tm-success)"
                     />
-                    <Line
+                    <Area
                       type="monotone"
                       dataKey="errors"
                       name="失败"
                       stroke="#DC2626"
-                      strokeWidth={1.5}
-                      strokeDasharray="4 4"
-                      dot={false}
+                      strokeWidth={2}
+                      fill="url(#tm-error)"
                     />
                   </AreaChart>
                 </ResponsiveContainer>
@@ -423,7 +427,7 @@ export function DashboardPage() {
             title="暂无收支记录"
             description={
               credits.data?.supported
-                ? "从本次部署起统计：签到收入写入 events，积分消耗按每日余额基线计算"
+                ? "从本次部署起统计：收入来自签到与充值，支出为逐请求账单回查的真实扣费"
                 : "收支接口不可用，请检查服务状态"
             }
           />

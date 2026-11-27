@@ -270,6 +270,24 @@ def _web_entry(
     )
 
 
+def _consumption_rate(raw: dict[str, Any]) -> Optional[float]:
+    """从 IDE 目录行里取出真实计费倍率。
+
+    倍率藏在 display_contact_config 里，那是一个字符串化的 JSON：
+      {"consumption_rate": {"enable": true, "data": {"rate": 0.78}}}
+    同行的 model_entitlement_usage_cost 恒为 1，不随模型变化，不能用。
+    """
+
+    contact = _json(raw.get("display_contact_config"))
+    block = contact.get("consumption_rate")
+    if not isinstance(block, dict):
+        return None
+    data = block.get("data")
+    if not isinstance(data, dict):
+        return None
+    return _float(data.get("rate"))
+
+
 def _ide_entry(raw: dict[str, Any], function: str, endpoint: str) -> Optional[ModelEntry]:
     if str(raw.get("usage") or "") != "chat_completion":
         return None
@@ -337,7 +355,7 @@ def _ide_entry(raw: dict[str, Any], function: str, endpoint: str) -> Optional[Mo
         or bool(max_window and max_window >= 950_000)
         or bool(context and context >= 950_000),
         config_source=int(raw.get("config_source") or 1),
-        usage_cost=default_variant.usage_cost if default_variant else None,
+        usage_cost=_consumption_rate(raw),
         source="ide",
         variants=variants,
     )
