@@ -302,6 +302,123 @@ def _scan_dsml(
     return "".join(prose), calls, "", False
 
 
+# 模型对同一件事的字段名不统一：名字有 name / tool_name / tool_call_name，
+# 参数有 arguments / input / args / parameters。解析器原先各认一部分，只写
+# 其中一种的模型就会被某一层静默吃掉，这里统一成同一套取值规则。
+_CALL_NAME_FIELDS = ("name", "tool_name", "tool_call_name")
+_CALL_ARGUMENT_FIELDS = ("arguments", "input", "args", "parameters")
+
+
+def _call_field_name(item: Mapping[str, Any], function: Mapping[str, Any]) -> str:
+    for source in (function, item):
+        if not isinstance(source, Mapping):
+            continue
+        for key in _CALL_NAME_FIELDS:
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _call_field_arguments(item: Mapping[str, Any], function: Mapping[str, Any]) -> Any:
+    for source in (function, item):
+        if not isinstance(source, Mapping):
+            continue
+        for key in _CALL_ARGUMENT_FIELDS:
+            if key in source and source[key] is not None:
+                return source[key]
+    return {}
+
+
+def _call_arguments_mapping(arguments: Any) -> Optional[dict[str, Any]]:
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return None
+    if isinstance(arguments, Mapping):
+        return dict(arguments)
+    return None
+
+
+_FENCED_TAIL_RE = re.compile(
+    r"```[A-Za-z0-9_+.\-]*[ \t]*\r?\n?(?P<body>.*?)```[ \t\r\n]*\Z", re.S
+)
+
+
+def _schema_matches(arguments: Mapping[str, Any], schema: Mapping[str, Any]) -> bool:
+    """参数键与工具 schema 完全吻合：无未知键、必填项齐备。"""
+
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping) or not properties:
+        return False
+    if any(key not in properties for key in arguments):
+        return False
+    required = schema.get("required")
+    if isinstance(required, list):
+        for key in required:
+            if key not in arguments:
+                return False
+    return True
+
+
+def recover_fenced_json_calls(
+    text: str, tool_schemas: Optional[Mapping[str, Mapping[str, Any]]] = None
+) -> tuple[str, list[dict[str, Any]], bool]:
+    """把模型写在 ```json 围栏里的裸参数对象还原成工具调用。
+
+    有些模型不写桥接标记，直接把一次调用的参数对象放进围栏。对象里没有
+    工具名，所以只按本次声明的 schema 反推：参数键唯一匹配一个工具才还原；
+    匹配不到就原样当正文，匹配到多个则标记 ``suspicious``，交给调用方决定
+    不能静默结束这一轮。
+
+    返回 ``(clean_text, calls, suspicious)``。
+    """
+
+    if not text or not tool_schemas:
+        return text, [], False
+    match = _FENCED_TAIL_RE.search(text)
+    if not match:
+        return text, [], False
+    body = match.group("body").strip()
+    if not body:
+        return text, [], False
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return text, [], False
+    items = data if isinstance(data, list) else [data]
+    if not items or not all(isinstance(item, Mapping) for item in items):
+        return text, [], False
+    calls: list[dict[str, Any]] = []
+    ambiguous = False
+    for item in items:
+        function = item.get("function") if isinstance(item.get("function"), Mapping) else {}
+        name = _call_field_name(item, function)
+        if name:
+            arguments = _call_arguments_mapping(_call_field_arguments(item, function))
+            if arguments is None or name not in tool_schemas:
+                # 写了名字但参数坏了、或名字不在本次声明里：这是调用尝试，
+                # 不是普通正文，不能静默当成功。
+                return text, [], True
+            calls.append({"name": name, "arguments": arguments})
+            continue
+        candidates = [
+            key
+            for key, schema in tool_schemas.items()
+            if isinstance(schema, Mapping) and _schema_matches(item, schema)
+        ]
+        if len(candidates) == 1:
+            calls.append({"name": candidates[0], "arguments": dict(item)})
+        elif candidates:
+            ambiguous = True
+        else:
+            return text, [], False
+    if ambiguous or not calls:
+        return text, [], True
+    return text[: match.start()].rstrip(), calls, False
+
+
 def _parse_json_tool_calls(block: str) -> list[dict[str, Any]]:
     try:
         data = json.loads(block)
@@ -322,12 +439,10 @@ def _parse_json_tool_calls(block: str) -> list[dict[str, Any]]:
         if not isinstance(item, Mapping):
             continue
         function = item.get("function") if isinstance(item.get("function"), Mapping) else item
-        name = str(function.get("name") or item.get("name") or "").strip()
+        name = _call_field_name(item, function)
         if not name:
             continue
-        raw_arguments = function.get(
-            "arguments", function.get("input", function.get("parameters", item.get("arguments", {})))
-        )
+        raw_arguments = _call_field_arguments(item, function)
         calls.append({"name": name, "arguments": _native_call_arguments(raw_arguments)})
     return calls
 
@@ -1109,6 +1224,40 @@ def _prepare_history(
     return prepared
 
 
+def _render_arguments_xml(arguments: Any, limit: int = 2000) -> str:
+    """把参数对象写成桥接格式的 ``<parameter=...>`` 串。
+
+    历史里用裸 JSON 展示参数时，模型会把它当成"写法示例"整段抄进正文，
+    于是出现 ```json 围栏里的裸参数对象。改用目标格式展示，既去掉了可抄
+    的样本，也给模型提供了一份正确示例。
+    """
+
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            return ""
+    if not isinstance(arguments, Mapping):
+        return ""
+    parts: list[str] = []
+    for key, value in arguments.items():
+        text = (
+            value
+            if isinstance(value, str)
+            else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        )
+        if len(text) > limit:
+            text = text[:limit] + f"…[{len(text)} chars]"
+        text = text.replace("</parameter>", "<\\/parameter>")
+        parts.append(f"<parameter={key}>{text}</parameter>")
+    return "".join(parts)
+
+
+def _render_call_xml(name: str, arguments: Any) -> str:
+    rendered = _render_arguments_xml(arguments, limit=800)
+    return f"<tool_call><function={name}>{rendered}</function></tool_call>"
+
+
 def _completed_tool_call_reminder(messages: list[Mapping[str, Any]]) -> str:
     calls: dict[str, dict[str, Any]] = {}
     order: list[str] = []
@@ -1180,19 +1329,20 @@ def _completed_tool_call_reminder(messages: list[Mapping[str, Any]]) -> str:
 
     if not completed:
         return ""
-    selected: list[dict[str, Any]] = []
+    selected: list[str] = []
     total = 0
     for call in completed[:20]:
-        encoded = json.dumps(call, ensure_ascii=False, separators=(",", ":"))
-        if selected and total + len(encoded) > 4000:
+        rendered = _render_call_xml(
+            str(call.get("name") or ""), call.get("arguments")
+        )
+        if selected and total + len(rendered) > 4000:
             break
-        selected.append(call)
-        total += len(encoded)
+        selected.append(rendered)
+        total += len(rendered)
     omitted = len(completed) - len(selected)
     text = (
         "Completed client tool calls (already returned; do not repeat unless "
-        "you need a fresh value):\n"
-        + json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+        "you need a fresh value):\n" + "\n".join(selected)
     )
     if omitted:
         text += f"\n({omitted} more completed call(s) omitted)"
@@ -1404,6 +1554,16 @@ def convert_messages(
     reminder = ""
     if include_completed_calls and tools and tool_choice != "none":
         reminder = _completed_tool_call_reminder(messages)
+    format_note = ""
+    if tool_prompt:
+        # 格式约束放在尾部：长上下文里系统提示头部的写法要求会被稀释，
+        # 而每轮紧贴输入的这一行更难被忽略。
+        format_note = (
+            "Tool call format reminder: to call a tool output exactly "
+            "<tool_call><function=tool_name><parameter=arg_name>value</parameter>"
+            "</function></tool_call> with no prose around it. Never write the "
+            "arguments as a ```json block."
+        )
 
     for index, message in enumerate(messages):
         if not isinstance(message, Mapping):
@@ -1450,7 +1610,8 @@ def convert_messages(
             # The assistant tool-call history is intentionally not echoed as
             # text.  Models tend to copy a textual call record as their next
             # answer, which looks like a tool call but is returned as content.
-            # Tool results below carry id/name/arguments instead.
+            # Tool results below carry id/name and their arguments in the
+            # bridged <parameter> form instead of raw JSON.
             text = _content_text(content)
             blocks = _content_blocks(text)
             has_calls = isinstance(raw_calls, list) and bool(raw_calls)
@@ -1484,27 +1645,21 @@ def convert_messages(
             )
             record = call_records.get(call_id, {})
             name = str(message.get("name") or record.get("name") or "tool")
-            arguments = record.get("arguments")
-            if arguments is None:
-                arguments_text = "unknown"
-            elif isinstance(arguments, str):
-                arguments_text = arguments
-            else:
-                arguments_text = json.dumps(
-                    arguments, ensure_ascii=False, separators=(",", ":")
-                )
             status = "failed" if _tool_result_failed(message, text) else "succeeded"
+            rendered_arguments = _render_arguments_xml(record.get("arguments"))
+            header = (
+                f"Client tool result (already returned; use this value) "
+                f"id={call_id} name={name} status={status}:\n"
+            )
+            if rendered_arguments:
+                header += f"arguments: {rendered_arguments}\n"
             converted.append(
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "text",
-                            "text": (
-                                f"Client tool result (already returned; use this value) "
-                                f"id={call_id} name={name} arguments={arguments_text} "
-                                f"status={status}:\n{text}"
-                            ),
+                            "text": header + text,
                         }
                     ],
                 }
@@ -1523,8 +1678,9 @@ def convert_messages(
             converted.insert(
                 0, {"role": "system", "content": [{"type": "text", "text": system}]}
             )
-    if reminder:
-        _attach_tail_note(converted, reminder)
+    tail_note = "\n".join(part for part in (format_note, reminder) if part)
+    if tail_note:
+        _attach_tail_note(converted, tail_note)
     return converted
 
 
@@ -1942,14 +2098,10 @@ def _parse_tool_block(block: str) -> list[dict[str, Any]]:
         if not isinstance(item, Mapping):
             continue
         function = item.get("function") if isinstance(item.get("function"), Mapping) else item
-        name = str(
-            function.get("name") or item.get("name") or item.get("tool_name") or ""
-        ).strip()
+        name = _call_field_name(item, function)
         if not name:
             continue
-        arguments = function.get(
-            "arguments", item.get("arguments", item.get("input", {}))
-        )
+        arguments = _call_field_arguments(item, function)
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)

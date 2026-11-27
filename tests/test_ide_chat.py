@@ -393,9 +393,9 @@ def test_convert_messages_multiple_tool_calls_and_results() -> None:
         if item["role"] == "user" and "Client tool result" in item["content"][0]["text"]
     ]
     assert len(results) == 2
-    assert "id=call_a" in results[0] and 'arguments={"path":"a.txt"}' in results[0]
+    assert "id=call_a" in results[0] and "<parameter=path>a.txt</parameter>" in results[0]
     assert "AAA" in results[0]
-    assert "id=call_b" in results[1] and 'arguments={"path":"b.txt"}' in results[1]
+    assert "id=call_b" in results[1] and "<parameter=path>b.txt</parameter>" in results[1]
     assert "BBB" in results[1]
     # 助手那轮的调用记录不回显成正文，避免模型照抄
     assert not any(
@@ -602,7 +602,7 @@ def test_completed_tool_call_reminder_skips_failed_results() -> None:
     }
     reminder = ide_chat._completed_tool_call_reminder([call, success])
     assert "Completed client tool calls" in reminder
-    assert '"name":"read"' in reminder
+    assert "<function=read><parameter=path>a</parameter>" in reminder
     assert ide_chat._completed_tool_call_reminder([call, failed]) == ""
 
 
@@ -711,7 +711,8 @@ def test_convert_messages_builds_tool_prompt_and_history() -> None:
         if item["role"] == "user" and "Client tool result" in item["content"][0]["text"]
     )
     assert "status=succeeded" in tool_result["content"][0]["text"]
-    assert 'arguments={"city":"Beijing"}' in tool_result["content"][0]["text"]
+    assert 'arguments={"city":"Beijing"}' not in tool_result["content"][0]["text"]
+    assert "<parameter=city>Beijing</parameter>" in tool_result["content"][0]["text"]
     assert "sunny" in tool_result["content"][0]["text"]
 
 
@@ -1224,3 +1225,126 @@ def test_tool_block_filter_final_flags_cut_argument() -> None:
     assert flt.native_truncated is False
     assert flt.feed(text, final=True) == ("", [])
     assert flt.native_truncated is True
+
+
+def test_recover_fenced_bare_json_call_maps_unique_schema() -> None:
+    text = (
+        "编译 v0.46:\n```json\n"
+        '{"command":"gradle :app:assembleRelease","run_in_background":true}\n```'
+    )
+    schemas = {
+        "RunCommand": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string"},
+                "run_in_background": {"type": "boolean"},
+            },
+            "required": ["command"],
+        },
+        "Read": {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+        },
+    }
+    clean, calls, suspicious = ide_chat.recover_fenced_json_calls(text, schemas)
+    assert clean == "编译 v0.46:"
+    assert calls == [
+        {
+            "name": "RunCommand",
+            "arguments": {
+                "command": "gradle :app:assembleRelease",
+                "run_in_background": True,
+            },
+        }
+    ]
+    assert suspicious is False
+
+
+def test_recover_fenced_plain_json_answer_is_left_alone() -> None:
+    text = '```json\n{"answer": 42}\n```'
+    clean, calls, suspicious = ide_chat.recover_fenced_json_calls(
+        text, {"Read": {"properties": {"file_path": {"type": "string"}}}}
+    )
+    assert clean == text
+    assert calls == []
+    assert suspicious is False
+
+
+def test_recover_fenced_bare_json_flags_ambiguous_tools() -> None:
+    text = '```json\n{"command": "ls"}\n```'
+    schemas = {
+        "Bash": {"properties": {"command": {"type": "string"}}, "required": ["command"]},
+        "Shell": {"properties": {"command": {"type": "string"}}, "required": ["command"]},
+    }
+    clean, calls, suspicious = ide_chat.recover_fenced_json_calls(text, schemas)
+    assert clean == text
+    assert calls == []
+    assert suspicious is True
+
+
+def test_recover_fenced_named_call_uses_declared_tool() -> None:
+    text = '```json\n{"name": "Read", "arguments": {"file_path": "a.py"}}\n```'
+    clean, calls, suspicious = ide_chat.recover_fenced_json_calls(
+        text, {"Read": {"properties": {"file_path": {"type": "string"}}}}
+    )
+    assert clean == ""
+    assert calls == [{"name": "Read", "arguments": {"file_path": "a.py"}}]
+    assert suspicious is False
+
+
+def test_recover_fenced_undeclared_name_is_suspicious() -> None:
+    text = '```json\n{"name": "Shell", "arguments": {"command": "ls"}}\n```'
+    clean, calls, suspicious = ide_chat.recover_fenced_json_calls(
+        text, {"Read": {"properties": {"file_path": {"type": "string"}}}}
+    )
+    assert clean == text
+    assert calls == []
+    assert suspicious is True
+
+
+def test_completed_call_reminder_uses_bridge_format() -> None:
+    messages = [
+        {"role": "user", "content": "读文件"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"a.txt"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+    ]
+    reminder = ide_chat._completed_tool_call_reminder(messages)
+    assert (
+        "<tool_call><function=read_file><parameter=path>a.txt</parameter>"
+        "</function></tool_call>" in reminder
+    )
+    assert '"arguments"' not in reminder
+
+
+def test_convert_messages_appends_tail_format_reminder() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                },
+            },
+        }
+    ]
+    converted = ide_chat.convert_messages(
+        [{"role": "user", "content": "读文件"}], tools
+    )
+    tail = converted[-1]["content"][-1]["text"]
+    assert "Tool call format reminder" in tail

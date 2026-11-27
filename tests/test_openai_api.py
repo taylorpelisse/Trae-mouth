@@ -1355,3 +1355,122 @@ def test_chat_request_level_upstream_error_does_not_cool_accounts(config) -> Non
         assert "InvalidParameter" in response.text
         assert len(seen_tokens) == 1
         assert all(store.get(item).status == "active" for item in account_ids)
+
+
+def _finish_reason_of(chunks: list[str]) -> str:
+    for chunk in chunks:
+        if not chunk.startswith("data: {"):
+            continue
+        for choice in json.loads(chunk[6:].strip())["choices"]:
+            if choice.get("finish_reason"):
+                return choice["finish_reason"]
+    return ""
+
+
+RUN_COMMAND_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string"},
+        "run_in_background": {"type": "boolean"},
+    },
+    "required": ["command"],
+}
+
+
+def test_translator_recovers_fenced_bare_json_call() -> None:
+    translator = OpenAIStreamTranslator(
+        "test-model",
+        tools_expected=True,
+        tool_schemas={"RunCommand": RUN_COMMAND_SCHEMA},
+    )
+    for piece in (
+        "编译 v0.46:\n",
+        "```json\n",
+        '{"command":"gradle :app:assembleRelease","run_in_background":true}',
+        "\n```",
+    ):
+        translator.feed({"event": "output", "data": {"response": piece}})
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    chunks = translator.finalize()
+    content, calls = collect_deltas(chunks)
+    assert calls == [
+        ("RunCommand", {"command": "gradle :app:assembleRelease", "run_in_background": True})
+    ]
+    assert _finish_reason_of(chunks) == "tool_calls"
+    # 非流式内容是最终展示给客户端的正文，围栏块应被剥掉。
+    assert translator.result()["choices"][0]["message"]["content"] == "编译 v0.46:"
+
+
+def test_translator_ambiguous_fenced_call_is_not_stop() -> None:
+    schemas = {
+        "Bash": {"properties": {"command": {"type": "string"}}, "required": ["command"]},
+        "Shell": {"properties": {"command": {"type": "string"}}, "required": ["command"]},
+    }
+    translator = OpenAIStreamTranslator(
+        "test-model", tools_expected=True, tool_schemas=schemas
+    )
+    chunks = translator.feed(
+        {"event": "output", "data": {"response": '```json\n{"command": "ls"}\n```'}}
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    chunks.extend(translator.finalize())
+    content, calls = collect_deltas(chunks)
+    assert calls == []
+    assert "```json" in content
+    assert _finish_reason_of(chunks) == "length"
+
+
+def test_translator_recovers_call_from_reasoning() -> None:
+    translator = OpenAIStreamTranslator(
+        "test-model",
+        tools_expected=True,
+        tool_schemas={
+            "Read": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            }
+        },
+    )
+    translator.feed(
+        {
+            "event": "reasoning_delta",
+            "data": {
+                "delta": (
+                    "<tool_call><function=Read><parameter=file_path>a.py"
+                    "</parameter></function></tool_call>"
+                )
+            },
+        }
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    chunks = translator.finalize()
+    _content, calls = collect_deltas(chunks)
+    assert calls == [("Read", {"file_path": "a.py"})]
+    assert _finish_reason_of(chunks) == "tool_calls"
+
+
+def test_translator_dropped_truncated_call_is_length_not_stop() -> None:
+    translator = OpenAIStreamTranslator("test-model", tools_expected=True)
+    translator.feed(
+        {
+            "event": "output",
+            "data": {"response": '先说一句\n<trae_mouth_tool_call>{"command": "half'},
+        }
+    )
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    chunks = translator.finalize()
+    assert _finish_reason_of(chunks) == "length"
+
+
+def test_translator_streams_plain_text_without_marker_overhead() -> None:
+    translator = OpenAIStreamTranslator("test-model", tools_expected=True)
+    text = "编译完成，下面开始测试。" * 10
+    chunks: list[str] = []
+    for char in text:
+        chunks.extend(translator.feed({"event": "output", "data": {"response": char}}))
+    translator.feed({"event": "done", "data": {"finish_reason": "stop"}})
+    chunks.extend(translator.finalize())
+    content, calls = collect_deltas(chunks)
+    assert content == text
+    assert calls == []

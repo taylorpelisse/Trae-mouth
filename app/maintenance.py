@@ -721,6 +721,10 @@ class AccountMaintenance:
 
     def status(self, now: Optional[dt.datetime] = None) -> dict[str, Any]:
         now = now or dt.datetime.now()
+        # 先取运行状态再读持久化结果：任务完成时先把结果落库、再解除「进行中」，
+        # 反过来读会在两者之间出现 running=False 但 last 仍是旧值（看起来像
+        # 任务没有产出结果）。
+        running_now = {job: self.is_running(job) for job in JOB_LABELS}
         last = self._state().get("last") or {}
         total = len(self.active())
         # 下次轮到哪个账号拉目录，给设置页显示用（只读，不写库）
@@ -739,7 +743,7 @@ class AccountMaintenance:
         )
         jobs = {}
         for job, label in JOB_LABELS.items():
-            running = self.is_running(job)
+            running = running_now.get(job, False)
             jobs[job] = {
                 "label": label,
                 "slots": self.slots(job) if job in SCHEDULED_JOBS else [],

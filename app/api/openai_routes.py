@@ -270,6 +270,9 @@ class OpenAIStreamTranslator:
         self.content_filtered = False
         self.tools_expected = tools_expected
         self.dropped_truncated_call = False
+        self.bare_call_attempt = False
+        self.recovered_calls = 0
+        self.recovered_from_reasoning = False
         self.reasoning_as_content = reasoning_as_content
         self.tool_schemas = dict(tool_schemas or {})
         self.strict_tool_args = strict_tool_args
@@ -391,6 +394,10 @@ class OpenAIStreamTranslator:
         matches = [key for key in self.tool_schemas if key.lower() == lowered]
         if len(matches) == 1:
             return [(matches[0], arguments)]
+        # 未声明的名字直接丢弃，但要留痕：分不清是模型乱造工具还是解析误读。
+        logger.info(
+            "dropped undeclared tool name model=%s name=%s", self.model, name
+        )
         return []
 
     def _add_expanded(
@@ -415,14 +422,10 @@ class OpenAIStreamTranslator:
             if not isinstance(item, Mapping):
                 continue
             function = item.get("function") if isinstance(item.get("function"), Mapping) else item
-            name = str(
-                function.get("name") or item.get("name") or item.get("tool_call_name") or ""
-            ).strip()
+            name = ide_chat._call_field_name(item, function)
             if not name:
                 continue
-            arguments = function.get(
-                "arguments", item.get("arguments", item.get("input", {}))
-            )
+            arguments = ide_chat._call_field_arguments(item, function)
             if isinstance(arguments, str):
                 try:
                     arguments = json.loads(arguments)
@@ -433,7 +436,24 @@ class OpenAIStreamTranslator:
             )
             self._add_expanded(name, arguments, call_id)
 
-    def _emit_visible(self, chunks: list[str]) -> None:
+    def _emit_visible(self, chunks: list[str], fragment: str = "") -> None:
+        # 纯文本片段不可能含有桥接标记的起点（标记都以 "<"、反引号或历史
+        # 回声的 "[" 开头），可以直接下发，不必把累积全文重新扫一遍。长输出
+        # 下逐帧全量重扫是 O(n²)，长会话会越写越慢。
+        if (
+            fragment
+            and not self.filter.incomplete
+            and not self.filter.native_incomplete
+            # 过滤器可能扣着上一帧尾部的标记前缀没发，这时不能再走快路，
+            # 否则后面的碎片会绕过过滤直接漏成正文。
+            and len(self.visible) == len(self.response.text) - len(fragment)
+            and not any(char in fragment for char in "<`[")
+        ):
+            self.visible += fragment
+            self._start(chunks)
+            self.emitted_content = True
+            chunks.append(self._chunk({"content": fragment}))
+            return
         new_calls: list[dict[str, Any]]
         visible, new_calls = self.filter.feed(self.response.text)
         if visible.startswith(self.visible):
@@ -518,7 +538,7 @@ class OpenAIStreamTranslator:
         if name in {"text_delta"}:
             delta = self.response.add_delta(data.get("delta"))
             if delta:
-                self._emit_visible(chunks)
+                self._emit_visible(chunks, delta)
             return chunks
         if name in {"reasoning_delta"}:
             delta = self.reasoning.add_delta(data.get("delta"))
@@ -559,7 +579,7 @@ class OpenAIStreamTranslator:
                         chunks.append(self._chunk({"reasoning_content": delta}))
                 else:
                     self.response.add_delta(fragment)
-                    self._emit_visible(chunks)
+                    self._emit_visible(chunks, fragment)
             reasoning = data.get("reasoning_content")
             if isinstance(reasoning, str) and reasoning:
                 delta = self.reasoning.add_delta(reasoning)
@@ -636,6 +656,38 @@ class OpenAIStreamTranslator:
             else:
                 # A call marker quoted in prose is text, not an interrupted call.
                 visible += native
+        # 模型偶尔不写桥接标记，直接把一次调用的参数对象放进 ```json 围栏。
+        # 只在参数与本次声明的工具 schema 唯一吻合时还原——普通 JSON 回答不
+        # 会被当成调用；匹配到多个（如 Bash 与 Shell 同参）只标记可疑，交给
+        # finalize 决定这一轮不能以致 stop 结束。
+        visible, fenced_calls, suspicious = ide_chat.recover_fenced_json_calls(
+            visible, self.tool_schemas
+        )
+        if fenced_calls:
+            new_calls.extend(fenced_calls)
+            self.recovered_calls += len(fenced_calls)
+            logger.info(
+                "recovered %d fenced tool call(s) model=%s",
+                len(fenced_calls),
+                self.model,
+            )
+        if suspicious:
+            self.bare_call_attempt = True
+        # 有些模型把调用写进 reasoning_content 而正文为空。不回收的话客户端
+        # 只看到思考内容、本轮没有任何工具执行，同样会被当成正常完成。
+        if self.tools_expected and not self.calls and self.reasoning.text.strip():
+            reasoning_calls, reasoning_suspicious = self._calls_from_reasoning()
+            if reasoning_calls:
+                new_calls.extend(reasoning_calls)
+                self.recovered_calls += len(reasoning_calls)
+                self.recovered_from_reasoning = True
+                logger.info(
+                    "recovered %d tool call(s) from reasoning model=%s",
+                    len(reasoning_calls),
+                    self.model,
+                )
+            if reasoning_suspicious:
+                self.bare_call_attempt = True
         delta = ""
         if visible.startswith(self.visible):
             delta = visible[len(self.visible) :]
@@ -651,6 +703,47 @@ class OpenAIStreamTranslator:
                 str(call.get("name") or ""), call.get("arguments") or {}
             )
         return delta
+
+    def _calls_from_reasoning(self) -> tuple[list[dict[str, Any]], bool]:
+        """回收模型写在 reasoning_content 里的调用。"""
+
+        text = self.reasoning.text
+        if not text.strip():
+            return [], False
+        scanner = ToolBlockFilter(allow_tool_calls=True)
+        _visible, calls = scanner.feed(text, final=True)
+        _clean, fenced, suspicious = ide_chat.recover_fenced_json_calls(
+            text, self.tool_schemas
+        )
+        recovered = calls + fenced
+        if self.tool_schemas:
+            # 只在本次声明过的工具里认，避免把思考里引用的示例当调用。
+            recovered = [
+                call
+                for call in recovered
+                if str(call.get("name") or "") in self.tool_schemas
+            ]
+        return recovered, suspicious
+
+    def _finish_reason(self) -> str:
+        finish = (
+            "tool_calls"
+            if self.calls
+            else (
+                "content_filter"
+                if self.content_filtered
+                else self.finish_reason or "stop"
+            )
+        )
+        if finish not in {"stop", "length", "content_filter", "tool_calls"}:
+            finish = "stop"
+        if finish == "stop" and (
+            self.dropped_truncated_call or self.bare_call_attempt
+        ):
+            # 有正文但没有可用调用时返回 stop，客户端会当作任务完成；改成
+            # length 让客户端知道这一轮没写完，可以继续而不是静默结束。
+            finish = "length"
+        return finish
 
     def finalize(self) -> list[str]:
         chunks: list[str] = []
@@ -731,6 +824,17 @@ class OpenAIStreamTranslator:
                 account_fault=False,
             )
         if (
+            self.bare_call_attempt
+            and not self.calls
+            and not self.emitted_content
+            and not self.content_filtered
+        ):
+            # 认得出是调用尝试、但参数无法唯一映射到声明过的工具：报明确
+            # 错误，避免客户端看到正文就以为什么都做完了。
+            raise UpstreamError(
+                "model returned an unrecognized tool call", account_fault=False
+            )
+        if (
             self.tools_expected
             and not self.calls
             and not self.emitted_content
@@ -740,13 +844,7 @@ class OpenAIStreamTranslator:
             raise UpstreamError(
                 "model returned neither text nor a tool call", account_fault=False
             )
-        finish = (
-            "tool_calls"
-            if self.calls
-            else ("content_filter" if self.content_filtered else self.finish_reason or "stop")
-        )
-        if finish not in {"stop", "length", "content_filter", "tool_calls"}:
-            finish = "stop"
+        finish = self._finish_reason()
         if not self.emitted_content and not self.calls and not self.emitted_reasoning:
             chunks.append(self._chunk({"content": ""}))
         chunks.append(
@@ -767,13 +865,7 @@ class OpenAIStreamTranslator:
         return message
 
     def result(self) -> dict[str, Any]:
-        finish = (
-            "tool_calls"
-            if self.calls
-            else ("content_filter" if self.content_filtered else self.finish_reason or "stop")
-        )
-        if finish not in {"stop", "length", "content_filter", "tool_calls"}:
-            finish = "stop"
+        finish = self._finish_reason()
         return {
             "id": self.id,
             "object": "chat.completion",
