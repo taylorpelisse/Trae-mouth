@@ -235,6 +235,50 @@ def test_chat_reports_cached_tokens_and_request_id(config) -> None:
         assert events[0]["cached_tokens"] == 40
 
 
+def test_usage_lookup_by_request_id(config) -> None:
+    content = sse(
+        ("output", {"response": "ok"}),
+        (
+            "token_usage",
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "cache_read_tokens": 40,
+            },
+        ),
+        ("done", {"finish_reason": "stop"}),
+    )
+    seen: list[dict] = []
+    app, client = make_client(config, content, seen)
+    with client:
+        prepare(app, client)
+        response = client.post(
+            "/v1/chat/completions",
+            headers=auth(config),
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 200, response.text
+        request_id = response.headers["X-Request-Id"]
+
+        usage = client.get(f"/v1/usage/{request_id}", headers=auth(config))
+        assert usage.status_code == 200, usage.text
+        body = usage.json()
+        assert body["request_id"] == request_id
+        assert body["model"] == "test-model"
+        assert body["prompt_tokens"] == 100
+        assert body["completion_tokens"] == 5
+        assert body["cached_tokens"] == 40
+        # 这里没有账单回查，billing_ok 应为 false，调用方据此重试
+        assert body["billing_ok"] is False
+
+        missing = client.get("/v1/usage/req_missing", headers=auth(config))
+        assert missing.status_code == 404
+        assert client.get(f"/v1/usage/{request_id}").status_code == 401
+
+
 def test_chat_tool_calls_and_max_variant(config) -> None:
     block = (
         "<trae_mouth_tool_call>"

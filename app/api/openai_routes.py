@@ -1108,6 +1108,37 @@ def create_openai_router(
                 return
             yield event
 
+    @router.get("/v1/usage/{request_id}")
+    async def get_usage(
+        request_id: str,
+        auth: ApiAuth = Depends(authorize),
+    ) -> dict[str, Any]:
+        """按请求号回查单条用量（网关扩展）。
+
+        上游流式响应不带缓存命中数，真值由延迟账单回查异步补写；下游可以
+        取响应头 X-Request-Id 后重试本接口，直到 billing_ok 为 true。
+        """
+
+        if not auth.allows("chat"):
+            raise HTTPException(status_code=403, detail="api key scope denied")
+        event = api_keys.event_by_request_id(
+            request_id, api_key_id=auth.key_id
+        )
+        if event is None:
+            raise HTTPException(status_code=404, detail="usage not found")
+        return {
+            "object": "usage.event",
+            "request_id": str(event.get("request_id") or request_id),
+            "model": str(event.get("model") or ""),
+            "status": int(event.get("status") or 0),
+            "created_at": int(event.get("created_at") or 0),
+            "prompt_tokens": int(event.get("prompt_tokens") or 0),
+            "completion_tokens": int(event.get("completion_tokens") or 0),
+            "total_tokens": int(event.get("total_tokens") or 0),
+            "cached_tokens": int(event.get("cached_tokens") or 0),
+            "billing_ok": bool(event.get("billing_ok") or 0),
+        }
+
     @router.get("/v1/models")
     async def list_models(
         request: Request,

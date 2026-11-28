@@ -106,6 +106,58 @@ def test_api_key_usage_events(tmp_path) -> None:
     assert token
 
 
+def test_usage_by_request_is_scoped_to_api_key(config) -> None:
+    content = sse(
+        ("output", {"response": "ok"}),
+        ("done", {"finish_reason": "stop"}),
+    )
+    app, client = make_chat_client(config, content, [])
+    with client:
+        headers = setup_admin(client)
+        prepare(app, client)
+        first = client.post(
+            "/admin/api/keys", json={"name": "first"}, headers=headers
+        ).json()
+        second = client.post(
+            "/admin/api/keys", json={"name": "second"}, headers=headers
+        ).json()
+        store = app.state.api_keys
+        store.add_event(
+            request_id="req_usage_1",
+            api_key_id=first["key"]["id"],
+            model="test-model",
+            status=200,
+            prompt_tokens=100,
+            completion_tokens=5,
+            total_tokens=105,
+        )
+        auth_first = {"Authorization": f"Bearer {first['token']}"}
+        auth_second = {"Authorization": f"Bearer {second['token']}"}
+
+        # 账单还没回查：照常返回 200，由调用方决定是否重试
+        pending = client.get("/v1/usage/req_usage_1", headers=auth_first)
+        assert pending.status_code == 200, pending.text
+        body = pending.json()
+        assert body["prompt_tokens"] == 100
+        assert body["cached_tokens"] == 0
+        assert body["billing_ok"] is False
+
+        store.attach_billing("req_usage_1", cached_tokens=80, credits=1.5)
+        settled = client.get("/v1/usage/req_usage_1", headers=auth_first).json()
+        assert settled["cached_tokens"] == 80
+        assert settled["billing_ok"] is True
+        assert settled["total_tokens"] == 105
+        assert settled["object"] == "usage.event"
+
+        # 别的 key 查不到，用 404 表达，不泄露记录是否存在
+        assert (
+            client.get("/v1/usage/req_usage_1", headers=auth_second).status_code == 404
+        )
+        assert (
+            client.get("/v1/usage/req_missing", headers=auth_first).status_code == 404
+        )
+
+
 def test_db_key_auth_and_scopes(config) -> None:
     config.api_key = "static-key"
 

@@ -411,6 +411,30 @@ class ApiKeyStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def event_by_request_id(
+        self, request_id: str, *, api_key_id: Optional[str] = None
+    ) -> Optional[dict[str, Any]]:
+        """按请求号取单条用量。
+
+        api_key_id 非 None 时只在该 key 自己的记录里找，避免跨 key 越权读取。
+        """
+
+        if not request_id:
+            return None
+        clauses = ["request_id = ?"]
+        values: list[Any] = [request_id]
+        if api_key_id is not None:
+            clauses.append("api_key_id = ?")
+            values.append(api_key_id)
+        with self.db.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM usage_events WHERE "
+                + " AND ".join(clauses)
+                + " ORDER BY id DESC LIMIT 1",
+                tuple(values),
+            ).fetchone()
+        return dict(row) if row else None
+
     def usage_summary(
         self,
         *,
