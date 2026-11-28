@@ -199,6 +199,42 @@ def test_chat_nonstream_and_stream(config) -> None:
         assert "data: [DONE]" in text
 
 
+def test_chat_reports_cached_tokens_and_request_id(config) -> None:
+    content = sse(
+        ("output", {"response": "ok"}),
+        (
+            "token_usage",
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 5,
+                "cache_read_tokens": 40,
+            },
+        ),
+        ("done", {"finish_reason": "stop"}),
+    )
+    seen: list[dict] = []
+    app, client = make_client(config, content, seen)
+    with client:
+        prepare(app, client)
+        response = client.post(
+            "/v1/chat/completions",
+            headers=auth(config),
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert response.status_code == 200, response.text
+        request_id = response.headers.get("X-Request-Id")
+        assert request_id and request_id.startswith("req_")
+        body = response.json()
+        assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 40
+        # 对外的缓存数也要落到内部账本，否则管理端永远是 0
+        events = app.state.api_keys.events()
+        assert events and events[0]["request_id"] == request_id
+        assert events[0]["cached_tokens"] == 40
+
+
 def test_chat_tool_calls_and_max_variant(config) -> None:
     block = (
         "<trae_mouth_tool_call>"

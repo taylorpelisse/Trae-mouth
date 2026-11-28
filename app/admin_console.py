@@ -516,6 +516,7 @@ def create_admin_console_router(
         key: str = "",
         model: str = "",
         ip: str = "",
+        request_id: str = "",
         errors: bool = False,
         success: bool = False,
         _: str = Depends(current_admin),
@@ -533,6 +534,9 @@ def create_admin_console_router(
         if ip:
             clauses.append("source_ip LIKE ?")
             values.append(f"%{ip}%")
+        if request_id:
+            clauses.append("request_id = ?")
+            values.append(request_id)
         if errors:
             clauses.append("(status >= 400 OR error <> '')")
         if success:

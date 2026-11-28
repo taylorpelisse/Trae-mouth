@@ -845,6 +845,37 @@ def test_map_usage() -> None:
     assert usage["prompt_tokens_details"]["cached_tokens"] == 3
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ({"prompt_tokens": 100, "cache_read_tokens": 40}, 40),
+        ({"prompt_tokens": 100, "cache_read_token": 41}, 41),
+        ({"prompt_tokens": 100, "prompt_cache_hit_tokens": 42}, 42),
+        ({"prompt_tokens": 100, "cached_tokens": 43}, 43),
+        ({"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 44}}, 44),
+        ({"prompt_tokens": 100, "input_tokens_details": {"cached_tokens": 45}}, 45),
+        (
+            {
+                "prompt_tokens": 100,
+                "cache_read_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 46},
+            },
+            46,
+        ),
+        ({"prompt_tokens": 100, "cached_tokens": True}, 0),
+        ({"prompt_tokens": 100}, 0),
+    ],
+)
+def test_map_usage_recognizes_cached_aliases(raw, expected) -> None:
+    # 上游各家的缓存字段名不统一，全部归一成 OpenAI 的
+    # prompt_tokens_details.cached_tokens
+    usage = ide_chat.map_usage(raw)
+    if expected:
+        assert usage["prompt_tokens_details"] == {"cached_tokens": expected}
+    else:
+        assert "prompt_tokens_details" not in usage
+
+
 def test_stream_raw_converts_read_error_to_upstream_error() -> None:
     class BrokenStream(httpx.AsyncByteStream):
         async def __aiter__(self):

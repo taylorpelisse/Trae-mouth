@@ -57,6 +57,11 @@ def test_admin_console_read_endpoints(config) -> None:
         assert logs["items"][0]["total_tokens"] == 7
         assert logs["items"][0]["account_label"]
 
+        # 下游按 X-Request-Id 回查单条请求的用量（缓存命中事后对账）
+        filtered = client.get("/admin/api/logs?request_id=req_test").json()
+        assert [item["request_id"] for item in filtered["items"]] == ["req_test"]
+        assert client.get("/admin/api/logs?request_id=req_missing").json()["items"] == []
+
         instance = client.get("/admin/api/instance").json()
         assert instance["version"]
         assert instance["accounts"] >= 1

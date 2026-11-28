@@ -2275,7 +2275,28 @@ def map_usage(raw: Any) -> Optional[dict[str, Any]]:
     reasoning = usage.get("reasoning_tokens")
     if isinstance(reasoning, (int, float)) and reasoning > 0:
         result["completion_tokens_details"] = {"reasoning_tokens": int(reasoning)}
-    cached = usage.get("cache_read_input_tokens")
-    if isinstance(cached, (int, float)) and cached > 0:
-        result["prompt_tokens_details"] = {"cached_tokens": int(cached)}
+    cached = 0
+    for key in (
+        "cache_read_input_tokens",
+        "cache_read_tokens",
+        "cache_read_token",
+        "prompt_cache_hit_tokens",
+        "cached_tokens",
+    ):
+        value = usage.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            cached = int(value)
+            break
+    for holder in ("prompt_tokens_details", "input_tokens_details"):
+        nested = usage.get(holder)
+        if isinstance(nested, Mapping):
+            value = nested.get("cached_tokens")
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and value > 0
+            ):
+                cached = max(cached, int(value))
+    if cached > 0:
+        result["prompt_tokens_details"] = {"cached_tokens": cached}
     return result

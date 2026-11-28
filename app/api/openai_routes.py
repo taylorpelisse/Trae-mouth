@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Mapping, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 from pydantic import BaseModel, ConfigDict
 
@@ -1201,6 +1201,12 @@ def create_openai_router(
         total_tokens = int(
             payload.get("total_tokens") or prompt_tokens + completion_tokens
         )
+        cached_tokens = 0
+        details = payload.get("prompt_tokens_details")
+        if isinstance(details, Mapping):
+            cached_tokens = int(details.get("cached_tokens") or 0)
+        if prompt_tokens > 0:
+            cached_tokens = min(max(cached_tokens, 0), prompt_tokens)
         latency_ms = int((time.time() - started) * 1000)
         try:
             api_keys.add_event(
@@ -1213,6 +1219,7 @@ def create_openai_router(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 total_tokens=total_tokens,
+                cached_tokens=cached_tokens,
                 first_token_ms=first_token_ms,
                 latency_ms=latency_ms,
                 error=error,
@@ -1606,7 +1613,7 @@ def create_openai_router(
                             request_id,
                             int((result.get("usage") or {}).get("prompt_tokens") or 0),
                         )
-                    return result
+                    return JSONResponse(result, headers={"X-Request-Id": request_id})
 
                 try:
                     buffered, ok = await _preflight(stream)
@@ -1743,6 +1750,7 @@ def create_openai_router(
                     "X-Trae-Session-Id": session_id,
                     "X-Trae-Account-Id": record.id,
                     "X-Trae-Failover": "1" if attempts > 1 else "0",
+                    "X-Request-Id": request_id,
                 }
                 return StreamingResponse(
                     generator(),
